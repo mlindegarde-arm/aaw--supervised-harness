@@ -1,14 +1,13 @@
 use crate::domain::{Task, TaskId, Ticket, TicketId};
 use crate::error::{HarnessError, HarnessResult};
+use crate::interactive;
 use crate::runtime::{
     CommandExit, CommandResult, CommandRuntime, HumanSink, JsonSink, OutputMode, ResumeTaskOptions,
     TaskRunOptions, TicketResolveOptions,
 };
-use crate::security::{DefaultEnvironmentSanitizer, EnvironmentSanitizer};
-use crate::service::HarnessService;
-use std::collections::BTreeMap;
+use crate::service::{DefaultHarnessService, HarnessService};
 use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 
 pub fn run<I, S>(args: I) -> CommandExit
 where
@@ -44,14 +43,36 @@ where
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let tokens = args.into_iter().skip(1).collect::<Vec<_>>();
 
-    let service = PlaceholderService;
-    let runtime = CommandRuntime::new(&service);
+    let service = command_service(&tokens);
+    let runtime = CommandRuntime::new(service.as_ref());
 
     if tokens.is_empty() {
-        return run_interactive(stdin, stdout, stderr, &runtime);
+        return interactive::run_with_input(stdin, stdout, stderr, &runtime);
     }
 
     dispatch_tokens(tokens, stdout, stderr, &runtime)
+}
+
+fn command_service(tokens: &[String]) -> Box<dyn HarnessService> {
+    match crate::config::load_config(repo_hint(tokens).as_deref()) {
+        Ok(loaded) => match DefaultHarnessService::from_loaded_config(loaded) {
+            Ok(service) => Box::new(service),
+            Err(error) => Box::new(PlaceholderService::with_error(error)),
+        },
+        Err(error) => Box::new(PlaceholderService::with_error(error)),
+    }
+}
+
+fn repo_hint(tokens: &[String]) -> Option<PathBuf> {
+    tokens.iter().enumerate().find_map(|(index, token)| {
+        if token == "--repo" {
+            return tokens.get(index + 1).map(PathBuf::from);
+        }
+        token
+            .strip_prefix("--repo=")
+            .map(Path::new)
+            .map(Path::to_path_buf)
+    })
 }
 
 fn dispatch_tokens(
@@ -73,117 +94,6 @@ fn dispatch_tokens(
             runtime.dispatch(tokens, &mut sink)
         }
     }
-}
-
-fn run_interactive(
-    stdin: &mut dyn BufRead,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    runtime: &CommandRuntime<'_>,
-) -> CommandExit {
-    if let Err(err) = writeln!(
-        stdout,
-        "harness interactive mode; type exit or quit to leave."
-    ) {
-        return CommandExit::failure(format!("failed to write command output: {err}"));
-    }
-
-    let mut line = String::new();
-    loop {
-        if let Err(err) = write!(stdout, "harness> ") {
-            return CommandExit::failure(format!("failed to write command output: {err}"));
-        }
-        if let Err(err) = stdout.flush() {
-            return CommandExit::failure(format!("failed to write command output: {err}"));
-        }
-
-        line.clear();
-        match stdin.read_line(&mut line) {
-            Ok(0) => return CommandExit::success(),
-            Ok(_) => {}
-            Err(err) => {
-                return CommandExit::failure(format!("failed to read command input: {err}"));
-            }
-        }
-
-        let command = line.trim();
-        if command.is_empty() {
-            continue;
-        }
-        if command == "exit" || command == "quit" {
-            return CommandExit::success();
-        }
-        if let Some(shell_command) = command.strip_prefix('!') {
-            run_shell_escape(shell_command.trim_start(), stdout, stderr);
-            continue;
-        }
-
-        let output_mode = output_mode_hint_line(command).unwrap_or(OutputMode::Human);
-        let quiet = command.split_whitespace().any(|token| token == "--quiet");
-        match output_mode {
-            OutputMode::Human => {
-                let mut sink = HumanSink::new(stdout, stderr, quiet);
-                runtime.dispatch_line(command, &mut sink)
-            }
-            OutputMode::Json => {
-                let mut sink = JsonSink::new(stdout, stderr, quiet);
-                runtime.dispatch_line(command, &mut sink)
-            }
-        };
-    }
-}
-
-fn run_shell_escape(command: &str, stdout: &mut dyn Write, stderr: &mut dyn Write) {
-    if command.trim().is_empty() {
-        let _ = writeln!(stderr, "shell escape command cannot be empty");
-        return;
-    }
-
-    let cwd = discover_repo_root_for_shell_escape().unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    });
-    let env = std::env::vars().collect::<BTreeMap<_, _>>();
-    let env = DefaultEnvironmentSanitizer::new().sanitize(&env);
-
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env)
-        .stdin(Stdio::null())
-        .output();
-
-    match output {
-        Ok(output) => {
-            let _ = stdout.write_all(&output.stdout);
-            let _ = stderr.write_all(&output.stderr);
-            if !output.status.success() {
-                let code = output
-                    .status
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |code| code.to_string());
-                let _ = writeln!(stderr, "shell escape exited with {code}");
-            }
-        }
-        Err(err) => {
-            let _ = writeln!(stderr, "failed to run shell escape: {err}");
-        }
-    }
-}
-
-fn discover_repo_root_for_shell_escape() -> Option<std::path::PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    (!root.is_empty()).then(|| std::path::PathBuf::from(root))
 }
 
 fn output_mode_hint(tokens: &[String]) -> Option<OutputMode> {
@@ -208,15 +118,21 @@ fn output_mode_hint(tokens: &[String]) -> Option<OutputMode> {
     })
 }
 
-fn output_mode_hint_line(line: &str) -> Option<OutputMode> {
-    let tokens = crate::runtime::tokenize_shell_like(line).ok()?;
-    output_mode_hint(&tokens)
+struct PlaceholderService {
+    error: Option<String>,
 }
 
-struct PlaceholderService;
-
 impl PlaceholderService {
+    fn with_error(error: HarnessError) -> Self {
+        Self {
+            error: Some(error.to_string()),
+        }
+    }
+
     fn unavailable(&self, method: &str) -> HarnessError {
+        if let Some(error) = &self.error {
+            return HarnessError::External(format!("{method} is unavailable: {error}"));
+        }
         HarnessError::External(format!(
             "{method} is not wired yet; service integration belongs to the orchestrator workstream"
         ))
@@ -290,11 +206,12 @@ mod tests {
             &mut stderr,
         );
 
-        assert_eq!(exit.code(), 1);
+        assert_eq!(exit.code(), 0);
         let stdout = String::from_utf8(stdout).unwrap();
         assert_eq!(stdout.lines().count(), 1);
         let value: Value = serde_json::from_str(stdout.trim()).unwrap();
-        assert_eq!(value["status"], "failed");
+        assert_eq!(value["status"], "complete");
+        assert!(value["data"]["tasks"].is_array());
     }
 
     #[test]

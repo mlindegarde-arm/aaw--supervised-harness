@@ -1,6 +1,8 @@
+use crate::doctor::{DiagnosticStatus, DoctorOptions, DoctorReport};
 use crate::domain::{Task, TaskId, TaskStatus, Ticket, TicketId, TicketStatus};
 use crate::error::{HarnessError, HarnessResult};
 use crate::service::HarnessService;
+use crate::state::SqliteTaskStore;
 use clap::{Arg, ArgAction, Command};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -275,6 +277,18 @@ impl<'a> InteractiveSink<'a> {
         Self {
             inner: HumanSink::new(stdout, stderr, quiet),
         }
+    }
+
+    pub fn write_stdout(&mut self, bytes: &[u8]) -> HarnessResult<()> {
+        self.inner.stdout.write_all(bytes).map_err(io_error)
+    }
+
+    pub fn write_stderr(&mut self, bytes: &[u8]) -> HarnessResult<()> {
+        self.inner.stderr.write_all(bytes).map_err(io_error)
+    }
+
+    pub fn write_stderr_line(&mut self, message: &str) -> HarnessResult<()> {
+        writeln!(self.inner.stderr, "{message}").map_err(io_error)
     }
 }
 
@@ -619,10 +633,18 @@ impl<'a> CommandRuntime<'a> {
                 ),
                 json!({ "version": VERSION }),
             ),
-            ParsedCommand::Init => placeholder("init is not wired until config integration"),
-            ParsedCommand::Doctor { .. } => {
-                placeholder("doctor is not wired until diagnostics integration")
-            }
+            ParsedCommand::Init => init_result(runtime_options.repo.as_deref()),
+            ParsedCommand::Doctor {
+                offline,
+                providers,
+                deep,
+            } => doctor_result(crate::doctor::run_doctor(DoctorOptions::from_cli(
+                runtime_options.repo.clone(),
+                runtime_options.state_dir.clone(),
+                offline,
+                providers.as_deref(),
+                deep,
+            ))),
             ParsedCommand::TaskCreate {
                 title,
                 goal,
@@ -1375,6 +1397,33 @@ fn placeholder(message: &'static str) -> CommandResult {
         .with_event(CommandEvent::warn("placeholder", message))
 }
 
+fn init_result(repo: Option<&std::path::Path>) -> CommandResult {
+    match crate::config::init_repo(repo) {
+        Ok(init) => match SqliteTaskStore::open(&init.paths.state_file) {
+            Ok(_) => CommandResult::with_data(
+                CommandExit::new(
+                    CommandStatus::Complete,
+                    0,
+                    Some("harness initialized".to_string()),
+                ),
+                json!({
+                    "repo_root": init.paths.repo_root,
+                    "state_dir": init.paths.state_dir,
+                    "config_file": init.paths.config_file,
+                    "state_file": init.paths.state_file,
+                    "logs_dir": init.paths.logs_dir,
+                    "artifacts_dir": init.paths.artifacts_dir,
+                    "worktree_root": init.paths.worktree_root,
+                    "config_created": init.config_created,
+                    "harness_gitignore_warning": init.harness_gitignore_warning,
+                }),
+            ),
+            Err(err) => error_result(err),
+        },
+        Err(err) => error_result(err),
+    }
+}
+
 fn error_result(error: HarnessError) -> CommandResult {
     let exit = match &error {
         HarnessError::Usage(_)
@@ -1388,6 +1437,42 @@ fn error_result(error: HarnessError) -> CommandResult {
         }
     };
     CommandResult::new(exit)
+}
+
+fn doctor_result(report: DoctorReport) -> CommandResult {
+    let exit = if report.has_failures() {
+        CommandExit::doctor_failed(report.message())
+    } else {
+        CommandExit::new(CommandStatus::Complete, 0, Some(report.message()))
+    };
+    let checks = report.checks.clone();
+    let data = serde_json::to_value(&report).unwrap_or_else(|err| {
+        json!({
+            "serialization_error": err.to_string(),
+        })
+    });
+
+    checks
+        .into_iter()
+        .fold(CommandResult::with_data(exit, data), |result, check| {
+            result.with_event(doctor_event(&check))
+        })
+}
+
+fn doctor_event(check: &crate::doctor::DiagnosticCheck) -> CommandEvent {
+    let message = format!(
+        "{} {}: {}",
+        check.status.as_str().to_ascii_uppercase(),
+        check.label,
+        check.message
+    );
+    match check.status {
+        DiagnosticStatus::Pass | DiagnosticStatus::Skipped => {
+            CommandEvent::info(check.id.clone(), message)
+        }
+        DiagnosticStatus::Warn => CommandEvent::warn(check.id.clone(), message),
+        DiagnosticStatus::Fail => CommandEvent::error(check.id.clone(), message),
+    }
 }
 
 fn task_result(task: Task) -> CommandResult {
@@ -1475,8 +1560,13 @@ fn ticket_json(ticket: &Ticket) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use crate::domain::{RunId, RunStatus};
+    use crate::providers::{FakeHttpResponse, FakeHttpRoute, FakeHttpServer};
     use std::cell::RefCell;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
 
     const TASK_ID: &str = "task_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const TICKET_ID: &str = "ticket_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -1922,6 +2012,74 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.as_str(), TICKET_ID);
         assert_eq!(calls[0].1.model.as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn doctor_readiness_failures_return_exit_code_20() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_doctor_runtime_repo(temp.path().join("repo"));
+        config::init_repo(Some(&repo)).unwrap();
+        let server = FakeHttpServer::start(vec![FakeHttpRoute::new(
+            "GET",
+            "/api/tags",
+            FakeHttpResponse::json(500, serde_json::json!({"error": "not ready"})),
+        )])
+        .unwrap();
+        let mut harness_config = config::default_config();
+        harness_config.providers.ollama.base_url = server.base_url();
+        harness_config.providers.ollama.default_model = "local-model".to_string();
+        config::write_config(&repo, &harness_config).unwrap();
+
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = HumanSink::new(&mut stdout, &mut stderr, false);
+        let repo_arg = repo.to_str().unwrap().to_string();
+
+        let exit = runtime.dispatch(
+            [
+                "doctor",
+                "--providers",
+                "local",
+                "--repo",
+                repo_arg.as_str(),
+            ],
+            &mut sink,
+        );
+
+        assert_eq!(exit.status, CommandStatus::DoctorFailed);
+        assert_eq!(exit.code(), 20);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("doctor providers_local failed")
+        );
+    }
+
+    fn init_doctor_runtime_repo(repo: PathBuf) -> PathBuf {
+        fs::create_dir_all(&repo).unwrap();
+        run_doctor_runtime_git(&repo, &["init"]);
+        run_doctor_runtime_git(&repo, &["config", "user.email", "doctor@example.invalid"]);
+        run_doctor_runtime_git(&repo, &["config", "user.name", "Doctor Runtime Test"]);
+        fs::write(repo.join("README.md"), "# doctor runtime test\n").unwrap();
+        run_doctor_runtime_git(&repo, &["add", "."]);
+        run_doctor_runtime_git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn run_doctor_runtime_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[derive(Default)]

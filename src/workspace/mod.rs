@@ -319,7 +319,6 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     fn apply_patch(&self, patch: PatchCheck) -> HarnessResult<PatchApplyResult> {
-        let check = self.check_patch(patch.clone())?;
         let validation = validate_patch_safety(&patch.diff, &patch_validation_config(&patch))?;
         let stderr = command_stdin(
             &validation.apply.program,
@@ -327,7 +326,13 @@ impl WorkspaceManager for GitWorkspaceManager {
             Path::new(&validation.apply.cwd),
             &patch.diff,
         )?;
-        Ok(PatchApplyResult { check, stderr })
+        Ok(PatchApplyResult {
+            check: PatchCheckResult {
+                files_changed: validation.files_changed,
+                stderr: String::new(),
+            },
+            stderr,
+        })
     }
 
     fn cleanup_task_worktree(&self, task_id: &TaskId, force: bool) -> HarnessResult<()> {

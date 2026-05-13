@@ -32,6 +32,7 @@ impl FixtureKind {
 
 #[derive(Debug)]
 pub struct FixtureRepo {
+    #[allow(dead_code)]
     pub kind: FixtureKind,
     pub path: PathBuf,
 }
@@ -78,7 +79,11 @@ path = "src/lib.rs"
         ),
     )
     .expect("write fixture Cargo.toml");
-    fs::write(path.join(".gitignore"), "/target/\n/Cargo.lock\n").expect("write fixture gitignore");
+    fs::write(
+        path.join(".gitignore"),
+        "/target/\n/Cargo.lock\n/.harness/\n",
+    )
+    .expect("write fixture gitignore");
 
     let body = match kind {
         FixtureKind::RustSuccess => {
