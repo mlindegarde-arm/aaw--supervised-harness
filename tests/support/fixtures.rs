@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use harness::config::{self, ConfigPaths};
+use harness::domain::HarnessConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureKind {
     RustSuccess,
@@ -52,6 +55,76 @@ pub fn create_fixture(root: &Path, kind: FixtureKind) -> FixtureRepo {
     }
 
     FixtureRepo { kind, path }
+}
+
+pub fn create_or_reuse_fixture(root: &Path, kind: FixtureKind) -> FixtureRepo {
+    let path = root.join(kind.name());
+    if path.join("HARNESS_FIXTURE.md").exists()
+        && (kind == FixtureKind::NotGitRepo || path.join(".git").exists())
+    {
+        return FixtureRepo { kind, path };
+    }
+
+    create_fixture(root, kind)
+}
+
+pub fn inject_fake_provider_config(
+    repo: &Path,
+    ollama_base_url: &str,
+    openai_base_url: &str,
+) -> ConfigPaths {
+    inject_fake_provider_config_with_openai_policy(repo, ollama_base_url, openai_base_url, true)
+}
+
+pub fn inject_fake_provider_config_with_openai_policy(
+    repo: &Path,
+    ollama_base_url: &str,
+    openai_base_url: &str,
+    allow_untrusted_openai_url: bool,
+) -> ConfigPaths {
+    assert_local_provider_url(ollama_base_url);
+    assert_local_provider_url(openai_base_url);
+
+    let mut config = config::load_config(Some(repo))
+        .map(|loaded| loaded.config)
+        .unwrap_or_else(|_| HarnessConfig::default());
+    config.providers.ollama.base_url = ollama_base_url.to_string();
+    config.providers.ollama.default_model = "binary-local-model".to_string();
+    config.providers.ollama.max_retries = 0;
+    config.providers.ollama.connect_timeout_seconds = 2;
+    config.providers.ollama.timeout_seconds = 10;
+    config.providers.openai.base_url = openai_base_url.to_string();
+    config.providers.openai.default_model = "binary-ticket-model".to_string();
+    config.providers.openai.max_retries = 0;
+    config.providers.openai.connect_timeout_seconds = 2;
+    config.providers.openai.timeout_seconds = 10;
+    config.providers.openai.allow_untrusted_provider_url = allow_untrusted_openai_url;
+    config::write_config(repo, &config).expect("write fake provider config");
+
+    let loaded = config::load_config(Some(repo)).expect("reload fake provider config");
+    assert_local_provider_url(&loaded.config.providers.ollama.base_url);
+    assert_local_provider_url(&loaded.config.providers.openai.base_url);
+    assert_eq!(
+        loaded.config.providers.openai.allow_untrusted_provider_url,
+        allow_untrusted_openai_url
+    );
+    loaded.paths
+}
+
+pub fn assert_fake_provider_config(config: &HarnessConfig) {
+    assert_local_provider_url(&config.providers.ollama.base_url);
+    assert_local_provider_url(&config.providers.openai.base_url);
+    assert!(
+        config.providers.openai.allow_untrusted_provider_url,
+        "local OpenAI-compatible fake requires allow_untrusted_provider_url"
+    );
+}
+
+pub fn assert_local_provider_url(url: &str) {
+    assert!(
+        url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:"),
+        "provider URL must be local in binary e2e tests: {url}"
+    );
 }
 
 fn write_not_git_repo(path: &Path) {

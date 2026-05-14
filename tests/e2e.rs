@@ -1,7 +1,17 @@
+#[path = "support/binary.rs"]
+mod binary;
+#[path = "support/fake_providers.rs"]
+mod fake_providers;
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
-use fixtures::{FixtureKind, create_fixture};
+use binary::BinaryHarness;
+use fake_providers::{FakeOllamaServer, FakeOpenAiServer};
+use fixtures::{
+    FixtureKind, assert_fake_provider_config, assert_local_provider_url, create_fixture,
+    create_or_reuse_fixture, inject_fake_provider_config,
+    inject_fake_provider_config_with_openai_policy,
+};
 use harness::config::{ConfigPaths, init_repo, load_config};
 use harness::domain::{
     Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus, Event, EventId, EventLevel, Run,
@@ -35,6 +45,916 @@ use std::sync::{Arc, Mutex};
 
 const OWNER: &str = "e2e-owner";
 const SECRET: &str = "Authorization: Bearer sk-testsecret1234567890abcdef";
+
+#[test]
+fn binary_harness_runner_captures_stdout_stderr_and_exit_code() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let binary = BinaryHarness::new().current_dir(&fixture.path);
+
+    let init = binary.init_repo(&fixture.path);
+    assert!(init.status.success(), "{init:?}");
+    assert!(
+        init.stdout.contains("\"status\":\"complete\""),
+        "{}",
+        init.stdout
+    );
+    assert!(init.stderr.is_empty(), "{}", init.stderr);
+
+    let invalid = binary.run(["definitely-not-a-command"]);
+    assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
+    assert!(invalid.stdout.is_empty(), "{}", invalid.stdout);
+    assert!(
+        invalid.stderr.contains("unknown command"),
+        "{}",
+        invalid.stderr
+    );
+}
+
+#[test]
+fn binary_harness_fixture_repo_initializes_with_repo_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let binary = BinaryHarness::new();
+
+    let init_json = binary.init_repo_json(&fixture.path);
+    assert_eq!(init_json["status"], "complete");
+    assert_eq!(init_json["exit_code"], 0);
+    assert_eq!(
+        PathBuf::from(init_json["data"]["repo_root"].as_str().unwrap()),
+        fixture.path.canonicalize().unwrap()
+    );
+    assert!(fixture.path.join(".harness/config.toml").exists());
+    assert!(fixture.path.join(".harness/state.sqlite").exists());
+}
+
+#[test]
+fn binary_harness_config_injection_points_at_local_fake_providers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let binary = BinaryHarness::new();
+    let ollama = FakeOllamaServer::scripted("binary-local-model", [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        "binary-ticket-model",
+        [("resp_binary_unused", "unused ticket response")],
+    );
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    assert!(
+        paths.config_file.exists(),
+        "{}",
+        paths.config_file.display()
+    );
+
+    let loaded = load_config(Some(&fixture.path)).expect("load injected config");
+    assert_fake_provider_config(&loaded.config);
+    assert_eq!(loaded.config.providers.ollama.base_url, ollama.base_url());
+    assert_eq!(loaded.config.providers.openai.base_url, openai.base_url());
+}
+
+#[test]
+fn binary_harness_fake_provider_receives_records_and_scripts_requests() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        ticket_model,
+        [("resp_binary_001", "ticket response should remain unused")],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let repo = fixture.path.to_str().unwrap();
+    let rust_tool_dir = Path::new(env!("CARGO")).parent().unwrap().to_string_lossy();
+    let validation = format!("PATH={rust_tool_dir}:/usr/bin:/bin {} test", env!("CARGO"));
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary fix add",
+        "--goal",
+        "Make the intentionally failing fixture pass",
+        "--validation",
+        validation.as_str(),
+    ]);
+    assert!(created.status.success(), "{created:?}");
+    assert!(created.stderr.is_empty(), "{}", created.stderr);
+    let task_id = json_str(&created.stdout, "/data/task_id");
+
+    let ran = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "run",
+        task_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    assert!(!ran.stderr.contains("error:"), "{}", ran.stderr);
+    let ran_json: Value = serde_json::from_str(ran.stdout.trim()).unwrap();
+    assert_eq!(ran_json["status"], "complete");
+    assert_eq!(ran_json["exit_code"], 0);
+
+    let ollama_requests = ollama.requests();
+    let generate_requests = ollama_requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == "/api/generate")
+        .collect::<Vec<_>>();
+    assert_eq!(generate_requests.len(), 1, "{ollama_requests:?}");
+    let body = generate_requests[0].json_body().unwrap();
+    assert_eq!(body["model"], local_model);
+    assert!(
+        body["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("Make the intentionally failing fixture pass"))
+    );
+    assert!(
+        openai.requests().is_empty(),
+        "task run should not contact ticket provider"
+    );
+}
+
+#[test]
+fn binary_harness_sanitizes_inherited_provider_override_env() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        ticket_model,
+        [("resp_binary_unused", "ticket response should remain unused")],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .inherited_env("HARNESS_OLLAMA_BASE_URL", "http://127.0.0.1:9")
+        .inherited_env("HARNESS_OPENAI_BASE_URL", "https://example.invalid/v1")
+        .inherited_env("HARNESS_ALLOW_UNTRUSTED_PROVIDER_URL", "false")
+        .inherited_env("HARNESS_OLLAMA_DEFAULT_MODEL", "poisoned-local-model")
+        .inherited_env("HARNESS_OPENAI_DEFAULT_MODEL", "poisoned-ticket-model")
+        .inherited_env("ARM_OPENAI_API_KEY", "poisoned-inherited-key")
+        .inherited_env("OPENAI_API_KEY", "poisoned-inherited-key")
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let repo = fixture.path.to_str().unwrap();
+    let rust_tool_dir = Path::new(env!("CARGO")).parent().unwrap().to_string_lossy();
+    let validation = format!("PATH={rust_tool_dir}:/usr/bin:/bin {} test", env!("CARGO"));
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary env sanitize",
+        "--goal",
+        "Make the intentionally failing fixture pass",
+        "--validation",
+        validation.as_str(),
+    ]);
+    assert!(created.status.success(), "{created:?}");
+    assert!(created.stderr.is_empty(), "{}", created.stderr);
+    let task_id = json_str(&created.stdout, "/data/task_id");
+
+    let ran = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "run",
+        task_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    assert!(!ran.stderr.contains("error:"), "{}", ran.stderr);
+    let ran_json: Value = serde_json::from_str(ran.stdout.trim()).unwrap();
+    assert_eq!(ran_json["status"], "complete");
+    assert_eq!(ran_json["exit_code"], 0);
+
+    let ollama_requests = ollama.requests();
+    let generate_requests = ollama_requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == "/api/generate")
+        .collect::<Vec<_>>();
+    assert_eq!(generate_requests.len(), 1, "{ollama_requests:?}");
+    let body = generate_requests[0].json_body().unwrap();
+    assert_eq!(body["model"], local_model);
+    assert!(
+        openai.requests().is_empty(),
+        "task run should not contact ticket provider"
+    );
+}
+
+#[test]
+fn binary_harness_fake_openai_records_ordinal_responses() {
+    let openai = FakeOpenAiServer::scripted(
+        "binary-ticket-model",
+        [
+            ("resp_binary_first", "first scripted response"),
+            ("resp_binary_second", "second scripted response"),
+        ],
+    );
+    let first: Value = ureq::post(&format!("{}/responses", openai.base_url()))
+        .set("Authorization", "Bearer binary-test-key")
+        .send_json(json!({
+            "model": "binary-ticket-model",
+            "instructions": "",
+            "input": "question one",
+            "stream": false,
+            "store": false,
+            "max_output_tokens": 128,
+            "metadata": {},
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let second: Value = ureq::post(&format!("{}/responses", openai.base_url()))
+        .set("Authorization", "Bearer binary-test-key")
+        .send_json(json!({
+            "model": "binary-ticket-model",
+            "instructions": "",
+            "input": "question two",
+            "stream": false,
+            "store": false,
+            "max_output_tokens": 128,
+            "metadata": {},
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+
+    assert_eq!(first["id"], "resp_binary_first");
+    assert_eq!(second["id"], "resp_binary_second");
+    let requests = openai.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/responses")
+            .count(),
+        2,
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn binary_harness_real_provider_url_guard_rejects_non_local_urls() {
+    let result = std::panic::catch_unwind(|| {
+        assert_local_provider_url("https://openai-api-proxy.geo.arm.com/api/providers/openai-us/v1")
+    });
+    assert!(
+        result.is_err(),
+        "real provider URL should fail local e2e guard"
+    );
+}
+
+#[test]
+fn binary_harness_supervise_success_after_ticket_resolution() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustResumeAfterTicket);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        [
+            "STUCK\nreason: need product decision before normalizing input\nquestion: Should normalize trim and lowercase ASCII-compatible input?".to_string(),
+            resume_patch().to_string(),
+        ],
+    );
+    let openai = FakeOpenAiServer::scripted(
+        ticket_model,
+        [(
+            "resp_supervise_001",
+            format!(
+                "Decision: trim surrounding whitespace and lowercase the result.\nDo not leak {SECRET}."
+            ),
+        )],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+    let goal = format!("Make normalize pass. Evidence includes {SECRET}");
+
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise normalization",
+        "--goal",
+        goal.as_str(),
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    assert!(created.stderr.is_empty(), "{}", created.stderr);
+    let task_id = TaskId::parse(created_json["data"]["task_id"].as_str().unwrap()).unwrap();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--ticket-model",
+        ticket_model,
+        "--max-cycles",
+        "2",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "complete", 0);
+    let events = assert_supervise_ndjson_phases(
+        &supervised.stderr,
+        &["inspect", "run", "inspect", "resolve", "resume", "complete"],
+    );
+    assert_eq!(supervised_json["data"]["task_id"], task_id.as_str());
+    assert_eq!(supervised_json["data"]["cycles"], 1);
+    assert!(
+        supervised_json["data"]["next_commands"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        supervised_json["data"]["progress_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        events.len()
+    );
+
+    let store = SqliteTaskStore::open(&paths.state_file).expect("open sqlite state");
+    assert_eq!(
+        store.get_task(&task_id).unwrap().status,
+        TaskStatus::Complete
+    );
+    let resolved_tickets = json_string_array(&supervised_json, "/data/resolved_tickets");
+    let resolution_ids = json_string_array(&supervised_json, "/data/resolution_ids");
+    let run_ids = json_string_array(&supervised_json, "/data/run_ids");
+    assert_eq!(resolved_tickets.len(), 1);
+    assert_eq!(resolution_ids.len(), 1);
+    assert_eq!(run_ids.len(), 2);
+    let resolution_id = TicketResolutionId::parse(&resolution_ids[0]).unwrap();
+    let resolution = store.get_ticket_resolution(&resolution_id).unwrap();
+    assert_eq!(resolution.ticket_id.as_str(), resolved_tickets[0]);
+    assert!(resolution.consumed_at.is_some(), "{resolution:?}");
+    for run_id in &run_ids {
+        let run_id = RunId::parse(run_id).unwrap();
+        assert_run_artifacts_have_manifest(&store, &run_id);
+    }
+
+    let ollama_requests = ollama.requests();
+    let ollama_generate = provider_requests_for_path(&ollama_requests, "/api/generate");
+    assert_eq!(ollama_generate.len(), 2, "{ollama_requests:?}");
+    let first_prompt = ollama_generate[0]["prompt"].as_str().unwrap();
+    let second_prompt = ollama_generate[1]["prompt"].as_str().unwrap();
+    assert!(first_prompt.contains("[REDACTED"), "{first_prompt}");
+    assert!(!first_prompt.contains("sk-testsecret"), "{first_prompt}");
+    assert!(
+        second_prompt.contains("ticket_resolutions"),
+        "{second_prompt}"
+    );
+    assert!(second_prompt.contains("[REDACTED"), "{second_prompt}");
+    assert!(!second_prompt.contains("sk-testsecret"), "{second_prompt}");
+
+    let openai_requests = openai.requests();
+    let openai_responses = provider_requests_for_path(&openai_requests, "/responses");
+    assert_eq!(openai_responses.len(), 1, "{openai_requests:?}");
+    let ticket_input = openai_responses[0]["input"].as_str().unwrap();
+    assert!(ticket_input.contains("Should normalize"), "{ticket_input}");
+    assert!(!ticket_input.contains("sk-testsecret"), "{ticket_input}");
+
+    assert_no_secret_in_binary_surfaces(
+        &paths,
+        &[
+            &created.stdout,
+            &created.stderr,
+            &supervised.stdout,
+            &supervised.stderr,
+        ],
+        &[&ollama_requests, &openai_requests],
+    );
+}
+
+#[test]
+fn binary_harness_supervise_create_completes_with_final_json_and_progress_ndjson() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        "binary-ticket-model",
+        [("resp_supervise_create_unused", "unused")],
+    );
+    let binary = BinaryHarness::new().current_dir(&fixture.path);
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        "--create",
+        "--title",
+        "Binary supervise create add",
+        "--goal",
+        "Make the intentionally failing fixture pass",
+        "--validation",
+        validation.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--max-cycles",
+        "0",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "complete", 0);
+    assert_supervise_ndjson_phases(&supervised.stderr, &["inspect", "run", "complete"]);
+    let task_id = TaskId::parse(supervised_json["data"]["task_id"].as_str().unwrap()).unwrap();
+    assert!(
+        supervised_json["data"]["next_commands"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let store = SqliteTaskStore::open(&paths.state_file).expect("open sqlite state");
+    assert_eq!(
+        store.get_task(&task_id).unwrap().status,
+        TaskStatus::Complete
+    );
+    let run_ids = json_string_array(&supervised_json, "/data/run_ids");
+    assert_eq!(run_ids.len(), 1);
+    assert_run_artifacts_have_manifest(&store, &RunId::parse(&run_ids[0]).unwrap());
+    assert_eq!(
+        provider_requests_for_path(&ollama.requests(), "/api/generate").len(),
+        1
+    );
+    assert!(
+        provider_requests_for_path(&openai.requests(), "/responses").is_empty(),
+        "supervise --create success should not contact ticket provider"
+    );
+}
+
+#[test]
+fn binary_harness_supervise_resumes_resolved_unconsumed_ticket_without_new_openai_call() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustResumeAfterTicket);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        [
+            "STUCK\nreason: need product decision before normalizing input\nquestion: Should normalize trim and lowercase ASCII-compatible input?".to_string(),
+            resume_patch().to_string(),
+        ],
+    );
+    let openai = FakeOpenAiServer::scripted(
+        ticket_model,
+        [(
+            "resp_interrupted_001",
+            "Decision: trim surrounding whitespace and lowercase the result.",
+        )],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise interrupted normalization",
+        "--goal",
+        "Make normalize pass after a resolved ticket",
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    let task_id = TaskId::parse(created_json["data"]["task_id"].as_str().unwrap()).unwrap();
+
+    let stuck = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "run",
+        task_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+    ]);
+    let stuck_json = assert_binary_json_contract(&stuck, "stuck", 10);
+    let ticket_id = TicketId::parse(stuck_json["data"]["ticket_id"].as_str().unwrap()).unwrap();
+
+    let resolved = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "ticket",
+        "resolve",
+        ticket_id.as_str(),
+        "--model",
+        ticket_model,
+    ]);
+    assert_binary_json_contract(&resolved, "complete", 0);
+    assert_eq!(
+        provider_requests_for_path(&openai.requests(), "/responses").len(),
+        1
+    );
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id.as_str(),
+        "--ticket",
+        ticket_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--ticket-model",
+        ticket_model,
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "complete", 0);
+    assert_supervise_ndjson_phases(&supervised.stderr, &["inspect", "resume", "complete"]);
+    assert_eq!(
+        provider_requests_for_path(&openai.requests(), "/responses").len(),
+        1,
+        "resolved unconsumed ticket must not be resolved again"
+    );
+    assert_eq!(
+        provider_requests_for_path(&ollama.requests(), "/api/generate").len(),
+        2
+    );
+
+    let store = SqliteTaskStore::open(&paths.state_file).expect("open sqlite state");
+    assert_eq!(
+        store.get_task(&task_id).unwrap().status,
+        TaskStatus::Complete
+    );
+    assert!(
+        store
+            .list_ticket_resolutions(&ticket_id)
+            .unwrap()
+            .iter()
+            .all(|resolution| resolution.consumed_at.is_some())
+    );
+    assert_eq!(
+        supervised_json["data"]["resolved_tickets"][0],
+        ticket_id.as_str()
+    );
+}
+
+#[test]
+fn binary_harness_supervise_stops_after_escalation_limit_without_extra_openai_call() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustValidationFailsThenStuck);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        [
+            "STUCK\nreason: first local block\nquestion: What should change first?",
+            "STUCK\nreason: second local block\nquestion: What should change second?",
+        ],
+    );
+    let openai = FakeOpenAiServer::scripted(ticket_model, [("resp_supervise_cap", "Try once.")]);
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise cap",
+        "--goal",
+        "Stop after one escalation cycle",
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    let task_id = TaskId::parse(created_json["data"]["task_id"].as_str().unwrap()).unwrap();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id.as_str(),
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--ticket-model",
+        ticket_model,
+        "--max-cycles",
+        "1",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "stuck", 10);
+    assert_nonzero_next_commands(&supervised_json);
+    assert_supervise_ndjson_phases(
+        &supervised.stderr,
+        &[
+            "inspect", "run", "inspect", "resolve", "resume", "inspect", "stuck",
+        ],
+    );
+    assert_eq!(
+        provider_requests_for_path(&openai.requests(), "/responses").len(),
+        1,
+        "supervisor must not resolve the second ticket after the cycle cap"
+    );
+    assert_eq!(
+        provider_requests_for_path(&ollama.requests(), "/api/generate").len(),
+        2
+    );
+    let store = SqliteTaskStore::open(&paths.state_file).expect("open sqlite state");
+    assert_eq!(store.get_task(&task_id).unwrap().status, TaskStatus::Stuck);
+    assert_eq!(
+        store.latest_run_for_task(&task_id).unwrap().unwrap().status,
+        RunStatus::Stuck
+    );
+}
+
+#[test]
+fn binary_harness_supervise_missing_provider_readiness_exits_20() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustResumeAfterTicket);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        ["STUCK\nreason: need escalation\nquestion: What should the worker do?"],
+    );
+    let openai = FakeOpenAiServer::scripted(ticket_model, [("resp_readiness_unused", "unused")]);
+    let binary = BinaryHarness::new().current_dir(&fixture.path);
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise readiness",
+        "--goal",
+        "Escalate without provider credentials",
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    let task_id = created_json["data"]["task_id"].as_str().unwrap();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id,
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--ticket-model",
+        ticket_model,
+        "--max-cycles",
+        "1",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "doctor_failed", 20);
+    assert_nonzero_next_commands(&supervised_json);
+    assert_supervise_ndjson_phases(
+        &supervised.stderr,
+        &["inspect", "run", "inspect", "resolve", "failed"],
+    );
+    assert!(
+        provider_requests_for_path(&openai.requests(), "/responses").is_empty(),
+        "missing API key should fail readiness before contacting OpenAI-compatible HTTP"
+    );
+}
+
+#[test]
+fn binary_harness_supervise_security_block_exits_30_for_untrusted_openai_url() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustResumeAfterTicket);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        ["STUCK\nreason: need escalation\nquestion: What should the worker do?"],
+    );
+    let openai = FakeOpenAiServer::scripted(ticket_model, [("resp_security_unused", "unused")]);
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config_with_openai_policy(
+        &fixture.path,
+        &ollama.base_url(),
+        &openai.base_url(),
+        false,
+    );
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise security",
+        "--goal",
+        "Escalate with an untrusted credentialed provider URL",
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    let task_id = created_json["data"]["task_id"].as_str().unwrap();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id,
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--ticket-model",
+        ticket_model,
+        "--max-cycles",
+        "1",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "security_blocked", 30);
+    assert_nonzero_next_commands(&supervised_json);
+    assert_supervise_ndjson_phases(
+        &supervised.stderr,
+        &["inspect", "run", "inspect", "resolve", "failed"],
+    );
+    assert!(
+        provider_requests_for_path(&openai.requests(), "/responses").is_empty(),
+        "provider URL policy should block before contacting OpenAI-compatible HTTP"
+    );
+}
+
+#[test]
+fn binary_harness_supervise_provider_error_redacts_sentinel_everywhere() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let ollama = FakeOllamaServer::http_error(
+        local_model,
+        500,
+        &format!("local provider failed while handling {SECRET}"),
+    );
+    let openai = FakeOpenAiServer::scripted(
+        "binary-ticket-model",
+        [("resp_provider_error_unused", "unused")],
+    );
+    let binary = BinaryHarness::new().current_dir(&fixture.path);
+
+    binary.init_repo_json(&fixture.path);
+    let paths = inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let repo = fixture.path.to_str().unwrap();
+    let validation = cargo_validation_command();
+    let goal = format!("Make the intentionally failing fixture pass. Evidence includes {SECRET}");
+    let created = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "task",
+        "create",
+        "--title",
+        "Binary supervise provider error redaction",
+        "--goal",
+        goal.as_str(),
+        "--validation",
+        validation.as_str(),
+    ]);
+    let created_json = assert_binary_json_contract(&created, "complete", 0);
+    let task_id = created_json["data"]["task_id"].as_str().unwrap();
+
+    let supervised = binary.run([
+        "--repo",
+        repo,
+        "--output",
+        "json",
+        "supervise",
+        task_id,
+        "--max-attempts",
+        "1",
+        "--model",
+        local_model,
+        "--max-cycles",
+        "0",
+    ]);
+    let supervised_json = assert_binary_json_contract(&supervised, "stuck", 10);
+    assert_nonzero_next_commands(&supervised_json);
+    assert_supervise_ndjson_phases(&supervised.stderr, &["inspect", "run", "inspect", "stuck"]);
+
+    let ollama_requests = ollama.requests();
+    let openai_requests = openai.requests();
+    assert_eq!(
+        provider_requests_for_path(&ollama_requests, "/api/generate").len(),
+        1
+    );
+    assert!(
+        provider_requests_for_path(&openai_requests, "/responses").is_empty(),
+        "max-cycles 0 should prevent escalation after the redacted provider error"
+    );
+    assert_no_secret_in_binary_surfaces(
+        &paths,
+        &[
+            &created.stdout,
+            &created.stderr,
+            &supervised.stdout,
+            &supervised.stderr,
+        ],
+        &[&ollama_requests, &openai_requests],
+    );
+}
 
 #[test]
 fn init_and_offline_doctor_acceptance_create_private_state() {
@@ -917,6 +1837,159 @@ fn run_harness_cli<'a>(repo: &Path, args: impl IntoIterator<Item = &'a str>) -> 
         status: output.status,
         stdout: String::from_utf8(output.stdout).unwrap(),
         stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
+fn cargo_validation_command() -> String {
+    let rust_tool_dir = Path::new(env!("CARGO")).parent().unwrap().to_string_lossy();
+    format!("PATH={rust_tool_dir}:/usr/bin:/bin {} test", env!("CARGO"))
+}
+
+fn assert_binary_json_contract(
+    output: &binary::BinaryOutput,
+    expected_status: &str,
+    expected_exit_code: i32,
+) -> Value {
+    let stdout_lines = output.stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        stdout_lines.len(),
+        1,
+        "stdout must be exactly one final JSON object\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    let value: Value = serde_json::from_str(stdout_lines[0]).unwrap_or_else(|error| {
+        panic!(
+            "stdout final line is not JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+            output.stdout, output.stderr
+        )
+    });
+    assert_eq!(value["status"], expected_status, "{value:#?}");
+    assert_eq!(value["exit_code"], expected_exit_code, "{value:#?}");
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit_code),
+        "process exit must match final exit_code\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    value
+}
+
+fn assert_supervise_ndjson_phases(stderr: &str, expected_phases: &[&str]) -> Vec<Value> {
+    assert!(
+        !stderr.trim().is_empty(),
+        "expected progress NDJSON on stderr"
+    );
+    assert!(
+        !stderr.contains("info:") && !stderr.contains("warn:") && !stderr.contains("error:"),
+        "{stderr}"
+    );
+    let events = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap_or_else(|_| panic!("{line}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["phase"].as_str().unwrap_or("<missing>"))
+            .collect::<Vec<_>>(),
+        expected_phases,
+        "{events:#?}"
+    );
+    for event in &events {
+        assert_eq!(event["event"], "supervise.phase", "{event:#?}");
+        assert!(event["task_id"].as_str().is_some(), "{event:#?}");
+        assert!(
+            event["message"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert_eq!(event["status"], event["phase"], "{event:#?}");
+        assert_eq!(event["elapsed_ms"], 0, "{event:#?}");
+    }
+    events
+}
+
+fn assert_nonzero_next_commands(value: &Value) {
+    assert_ne!(value["exit_code"], 0, "{value:#?}");
+    assert!(
+        value["data"]["next_commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "{value:#?}"
+    );
+}
+
+fn json_string_array(value: &Value, pointer: &str) -> Vec<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing JSON array at {pointer} in {value}"))
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .unwrap_or_else(|| panic!("non-string item in {pointer}: {value}"))
+                .to_string()
+        })
+        .collect()
+}
+
+fn provider_requests_for_path(
+    requests: &[harness::providers::FakeHttpRequest],
+    path: &str,
+) -> Vec<Value> {
+    requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == path)
+        .map(|request| request.json_body().unwrap())
+        .collect()
+}
+
+fn assert_run_artifacts_have_manifest(store: &dyn TaskStore, run_id: &RunId) {
+    let artifacts = store.list_artifacts_for_run(run_id).unwrap();
+    assert!(!artifacts.is_empty(), "run {run_id} has no artifacts");
+    assert!(
+        artifacts.iter().any(|artifact| artifact.kind == "manifest"),
+        "{artifacts:#?}"
+    );
+    for artifact in &artifacts {
+        let path = PathBuf::from(&artifact.path);
+        assert!(path.exists(), "{}", path.display());
+        assert_eq!(artifact.sha256, sha256_file(&path), "{}", path.display());
+        assert_eq!(artifact.byte_len, fs::metadata(&path).unwrap().len());
+        if artifact.kind == "manifest" {
+            let text = fs::read_to_string(&path).unwrap();
+            let manifest: ArtifactManifest = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("manifest parse failed: {error}\n{text}"));
+            assert!(!manifest.prompt_contract_version.is_empty());
+            for record in &manifest.artifacts {
+                assert!(Path::new(&record.path).exists(), "{}", record.path);
+                assert_eq!(record.sha256, sha256_file(Path::new(&record.path)));
+                assert_eq!(record.byte_len, fs::metadata(&record.path).unwrap().len());
+            }
+        }
+    }
+}
+
+fn assert_no_secret_in_binary_surfaces(
+    paths: &ConfigPaths,
+    outputs: &[&str],
+    provider_requests: &[&[harness::providers::FakeHttpRequest]],
+) {
+    let store = SqliteTaskStore::open(&paths.state_file).expect("open sqlite state");
+    assert_no_secret_in_persisted_outputs(&store, &paths.state_file, &paths.artifacts_dir, outputs);
+    for requests in provider_requests {
+        for request in *requests {
+            assert!(
+                !request.body_string().contains("sk-testsecret"),
+                "{request:?}"
+            );
+            assert!(
+                !format!("{:?}", request.headers).contains("sk-testsecret"),
+                "{request:?}"
+            );
+        }
     }
 }
 

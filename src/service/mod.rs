@@ -1,15 +1,25 @@
+pub mod supervisor;
+
 use crate::domain::{HarnessConfig, Task, TaskId, Ticket, TicketId};
 use crate::orchestrator::RunOrchestrator;
 use crate::providers::{
     ModelProvider, ModelRequest, ModelResponse, OllamaProvider, OpenAiCompatibleProvider,
     ProviderError, ProviderErrorKind, ProviderFuture,
 };
-use crate::runtime::{CommandResult, ResumeTaskOptions, TaskRunOptions, TicketResolveOptions};
+use crate::runtime::{
+    CommandResult, OutputSink, ResumeTaskOptions, SuperviseCreateOptions, SuperviseTaskOptions,
+    TaskRunOptions, TicketResolveOptions,
+};
 use crate::state::{SqliteTaskStore, TaskStore};
 use crate::workspace::{CommandRunner, GitWorkspaceManager, WorkspaceManager};
 use crate::{HarnessError, HarnessResult};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+pub use supervisor::{
+    SUPERVISOR_PLACEHOLDER_MESSAGE, SupervisorService, SupervisorStateStore, SupervisorStateView,
+    SupervisorTaskState, supervise_placeholder_result,
+};
 
 pub trait HarnessService {
     fn create_task(
@@ -34,6 +44,46 @@ pub trait HarnessService {
         task_id: &TaskId,
         options: ResumeTaskOptions,
     ) -> HarnessResult<CommandResult>;
+
+    fn supervise_task(
+        &self,
+        task_id: &TaskId,
+        _options: SuperviseTaskOptions,
+    ) -> HarnessResult<CommandResult> {
+        Ok(supervise_placeholder_result(Some(task_id)))
+    }
+
+    fn supervise_task_streaming(
+        &self,
+        task_id: &TaskId,
+        options: SuperviseTaskOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        let result = self.supervise_task(task_id, options)?;
+        for event in &result.events {
+            sink.event(event)?;
+        }
+        Ok(result)
+    }
+
+    fn create_and_supervise_task(
+        &self,
+        _options: SuperviseCreateOptions,
+    ) -> HarnessResult<CommandResult> {
+        Ok(supervise_placeholder_result(None))
+    }
+
+    fn create_and_supervise_task_streaming(
+        &self,
+        options: SuperviseCreateOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        let result = self.create_and_supervise_task(options)?;
+        for event in &result.events {
+            sink.event(event)?;
+        }
+        Ok(result)
+    }
 }
 
 pub struct DefaultHarnessService {
@@ -169,5 +219,56 @@ impl HarnessService for DefaultHarnessService {
         options: ResumeTaskOptions,
     ) -> HarnessResult<CommandResult> {
         self.orchestrator.resume_task(task_id, options)
+    }
+
+    fn supervise_task(
+        &self,
+        task_id: &TaskId,
+        options: SuperviseTaskOptions,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator.supervise_task(task_id, options)
+    }
+
+    fn supervise_task_streaming(
+        &self,
+        task_id: &TaskId,
+        options: SuperviseTaskOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator
+            .supervise_task_with_progress_sink(task_id, options, sink)
+    }
+
+    fn create_and_supervise_task(
+        &self,
+        options: SuperviseCreateOptions,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator.create_and_supervise_task(options)
+    }
+
+    fn create_and_supervise_task_streaming(
+        &self,
+        options: SuperviseCreateOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator
+            .create_and_supervise_task_with_progress_sink(options, sink)
+    }
+}
+
+impl SupervisorService for DefaultHarnessService {
+    fn supervise_task(
+        &self,
+        task_id: &TaskId,
+        options: SuperviseTaskOptions,
+    ) -> HarnessResult<CommandResult> {
+        HarnessService::supervise_task(self, task_id, options)
+    }
+
+    fn create_and_supervise_task(
+        &self,
+        options: SuperviseCreateOptions,
+    ) -> HarnessResult<CommandResult> {
+        HarnessService::create_and_supervise_task(self, options)
     }
 }

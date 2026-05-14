@@ -1,0 +1,20 @@
+pub mod app;
+pub mod app_state;
+pub mod composer;
+pub mod input;
+pub mod panes;
+pub mod render;
+pub mod runtime_bridge;
+pub mod shell_escape;
+pub mod theme;
+pub mod transcript;
+
+pub use app::{TerminalCleanupGuard, TerminalMode, TuiApp, run_tui};
+pub use app_state::{CommandActivity, FooterState, HeaderState, TuiAppState, TuiFocus};
+pub use composer::{ComposerOutcome, ComposerState, SuggestionRow, SyntaxClass, SyntaxToken};
+pub use input::{ComposerCommand, KeyCode, KeyEvent, KeyModifiers};
+pub use panes::{PaneKind, PaneListState, PaneRefreshState, PaneRowView, SidePaneState};
+pub use render::{LayoutMode, TuiLayout, compute_layout, render_app};
+pub use runtime_bridge::{BridgeState, RuntimeBridge, RuntimeServiceFactory};
+pub use shell_escape::{ShellEscapeRunner, run_shell_escape};
+pub use transcript::{TranscriptEntry, TranscriptLimits, TranscriptSource, TranscriptState};

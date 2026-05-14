@@ -1,7 +1,10 @@
+pub mod supervisor_queries;
+
 use crate::domain::{
     Artifact, Attempt, AttemptId, Event, Run, RunId, RunStatus, Task, TaskId, TaskStatus,
     TaskValidationCommand, Ticket, TicketId, TicketResolution, TicketResolutionId, TicketStatus,
 };
+use crate::service::SupervisorStateStore;
 use crate::{HarnessError, HarnessResult};
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -37,7 +40,7 @@ pub struct RunUpdate {
     pub last_error: Option<String>,
 }
 
-pub trait TaskStore {
+pub trait TaskStore: SupervisorStateStore {
     fn insert_task(&self, task: Task, validation_commands: Vec<String>) -> HarnessResult<()>;
     fn list_tasks(&self, status: Option<TaskStatus>) -> HarnessResult<Vec<Task>>;
     fn get_task(&self, task_id: &TaskId) -> HarnessResult<Task>;

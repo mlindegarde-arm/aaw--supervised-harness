@@ -1,12 +1,30 @@
+pub mod catalog;
+pub mod events;
+pub mod supervise;
+
 use crate::doctor::{DiagnosticStatus, DoctorOptions, DoctorReport};
 use crate::domain::{Task, TaskId, TaskStatus, Ticket, TicketId, TicketStatus};
 use crate::error::{HarnessError, HarnessResult};
 use crate::service::HarnessService;
 use crate::state::SqliteTaskStore;
+use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, Command};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
+
+pub use catalog::{
+    CommandAction, CommandCatalog, CommandNodeSpec, CommandSpec, CommandTreeSpec,
+    MetaCommandAction, MetaCommandSpec, OptionAction, OptionSpec, PositionalSpec, StateQueryKind,
+    ValueKind, ValueSource, ValueSpec, build_cli, phase2_command_tree_seed,
+};
+pub use events::{
+    PaneArtifactRow, PaneRunRow, PaneSection, PaneStateSnapshot, PaneTaskRow, PaneTicketRow,
+    SuperviseProgressEvent, SuperviseProgressPhase, TranscriptEvent, TuiRuntimeEvent,
+};
+pub use supervise::{
+    CancellationToken, CooperativeCancellationToken, SuperviseCreateOptions, SuperviseTaskOptions,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -119,6 +137,7 @@ pub struct CommandEvent {
     pub kind: String,
     pub level: CommandEventLevel,
     pub message: String,
+    pub supervise_progress: Option<SuperviseProgressEvent>,
 }
 
 impl CommandEvent {
@@ -127,6 +146,7 @@ impl CommandEvent {
             kind: kind.into(),
             level: CommandEventLevel::Info,
             message: message.into(),
+            supervise_progress: None,
         }
     }
 
@@ -135,6 +155,7 @@ impl CommandEvent {
             kind: kind.into(),
             level: CommandEventLevel::Warn,
             message: message.into(),
+            supervise_progress: None,
         }
     }
 
@@ -143,6 +164,16 @@ impl CommandEvent {
             kind: kind.into(),
             level: CommandEventLevel::Error,
             message: message.into(),
+            supervise_progress: None,
+        }
+    }
+
+    pub fn supervise_progress(event: SuperviseProgressEvent, level: CommandEventLevel) -> Self {
+        Self {
+            kind: "supervise.phase".to_string(),
+            level,
+            message: event.message.clone(),
+            supervise_progress: Some(event),
         }
     }
 }
@@ -240,13 +271,20 @@ impl OutputSink for JsonSink<'_> {
             return Ok(());
         }
 
-        writeln!(
-            self.stderr,
-            "{}: {}",
-            event.level.as_str(),
-            event.message.trim_end()
-        )
-        .map_err(io_error)
+        if let Some(progress) = &event.supervise_progress {
+            serde_json::to_writer(&mut self.stderr, &progress.to_json()).map_err(|err| {
+                HarnessError::External(format!("failed to write JSON event output: {err}"))
+            })?;
+            writeln!(self.stderr).map_err(io_error)
+        } else {
+            writeln!(
+                self.stderr,
+                "{}: {}",
+                event.level.as_str(),
+                event.message.trim_end()
+            )
+            .map_err(io_error)
+        }
     }
 
     fn finish(&mut self, result: &CommandResult) -> HarnessResult<()> {
@@ -360,223 +398,87 @@ pub struct ResumeTaskOptions {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandSpec {
-    pub path: &'static [&'static str],
-    pub usage: &'static str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandCatalog {
-    commands: Vec<CommandSpec>,
-}
-
-impl CommandCatalog {
-    pub fn commands(&self) -> &[CommandSpec] {
-        &self.commands
-    }
-
-    pub fn help(&self) -> String {
-        let mut help = format!(
-            "harness {VERSION}\n\nUSAGE:\n    harness <command> [options]\n\nGLOBAL OPTIONS:\n    --output <human|json>\n    --quiet\n    --repo <path>\n    --state-dir <path>\n\nCOMMANDS:\n"
-        );
-        for command in &self.commands {
-            help.push_str("    ");
-            help.push_str(command.usage);
-            help.push('\n');
-        }
-        help
-    }
-}
-
 pub fn build_clap() -> Command {
-    let globals = [
-        Arg::new("output")
-            .long("output")
-            .value_parser(["human", "json"])
-            .global(true),
-        Arg::new("quiet")
-            .long("quiet")
-            .action(ArgAction::SetTrue)
-            .global(true),
-        Arg::new("repo")
-            .long("repo")
-            .value_name("path")
-            .global(true),
-        Arg::new("state-dir")
-            .long("state-dir")
-            .value_name("path")
-            .global(true),
-    ];
-
-    Command::new("harness")
+    let tree = phase2_command_tree_seed();
+    let mut command = Command::new(tree.name)
         .version(VERSION)
         .about("AI agent harness supervisor")
-        .disable_help_subcommand(true)
-        .args(globals)
-        .subcommand(Command::new("init").arg(Arg::new("repo").long("repo").value_name("path")))
-        .subcommand(
-            Command::new("doctor")
-                .arg(
-                    Arg::new("offline")
-                        .long("offline")
-                        .action(ArgAction::SetTrue),
-                )
-                .arg(
-                    Arg::new("providers")
-                        .long("providers")
-                        .value_parser(["local", "all"]),
-                )
-                .arg(Arg::new("deep").long("deep").action(ArgAction::SetTrue)),
-        )
-        .subcommand(
-            Command::new("task")
-                .subcommand(
-                    Command::new("create")
-                        .arg(Arg::new("title").long("title").required(true))
-                        .arg(Arg::new("goal").long("goal").required(true))
-                        .arg(
-                            Arg::new("validation")
-                                .long("validation")
-                                .action(ArgAction::Append)
-                                .required(true),
-                        ),
-                )
-                .subcommand(Command::new("list").arg(Arg::new("status").long("status")))
-                .subcommand(Command::new("get").arg(Arg::new("task-id").required(true)))
-                .subcommand(
-                    Command::new("run")
-                        .arg(Arg::new("task-id").required(true))
-                        .arg(Arg::new("max-attempts").long("max-attempts"))
-                        .arg(Arg::new("model").long("model")),
-                )
-                .subcommand(
-                    Command::new("cleanup")
-                        .arg(Arg::new("task-id").required(true))
-                        .arg(Arg::new("force").long("force").action(ArgAction::SetTrue))
-                        .arg(
-                            Arg::new("dry-run")
-                                .long("dry-run")
-                                .action(ArgAction::SetTrue),
-                        ),
-                ),
-        )
-        .subcommand(
-            Command::new("ticket")
-                .subcommand(Command::new("list").arg(Arg::new("status").long("status")))
-                .subcommand(Command::new("get").arg(Arg::new("ticket-id").required(true)))
-                .subcommand(
-                    Command::new("resolve")
-                        .arg(Arg::new("ticket-id").required(true))
-                        .arg(Arg::new("model").long("model")),
-                ),
-        )
-        .subcommand(
-            Command::new("resume")
-                .arg(Arg::new("task-id").required(true))
-                .arg(Arg::new("ticket").long("ticket"))
-                .arg(Arg::new("max-attempts").long("max-attempts"))
-                .arg(Arg::new("model").long("model")),
-        )
-        .subcommand(
-            Command::new("run")
-                .arg(Arg::new("title").long("title").required(true))
-                .arg(Arg::new("goal").long("goal").required(true))
-                .arg(
-                    Arg::new("validation")
-                        .long("validation")
-                        .action(ArgAction::Append)
-                        .required(true),
-                )
-                .arg(Arg::new("max-attempts").long("max-attempts"))
-                .arg(Arg::new("model").long("model")),
-        )
-        .subcommand(
-            Command::new("config")
-                .subcommand(Command::new("get"))
-                .subcommand(
-                    Command::new("set")
-                        .arg(Arg::new("key").required(true))
-                        .arg(Arg::new("value").required(true)),
-                ),
-        )
-        .subcommand(
-            Command::new("workspace").subcommand(
-                Command::new("prune")
-                    .arg(
-                        Arg::new("dry-run")
-                            .long("dry-run")
-                            .action(ArgAction::SetTrue),
-                    )
-                    .arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
-            ),
-        )
+        .disable_help_subcommand(true);
+    for option in tree.globals {
+        command = command.arg(clap_arg_from_option(option).global(true));
+    }
+    for child in tree.commands {
+        command = command.subcommand(clap_command_from_spec(child));
+    }
+    command
 }
 
-pub fn build_cli() -> CommandCatalog {
-    CommandCatalog {
-        commands: vec![
-            CommandSpec {
-                path: &["init"],
-                usage: "init [--repo <path>]",
-            },
-            CommandSpec {
-                path: &["doctor"],
-                usage: "doctor [--offline] [--providers local|all] [--deep]",
-            },
-            CommandSpec {
-                path: &["task", "create"],
-                usage: "task create --title <title> --goal <goal> --validation <cmd>...",
-            },
-            CommandSpec {
-                path: &["task", "list"],
-                usage: "task list [--status <status>]",
-            },
-            CommandSpec {
-                path: &["task", "get"],
-                usage: "task get <task-id>",
-            },
-            CommandSpec {
-                path: &["task", "run"],
-                usage: "task run <task-id> [--max-attempts <n>] [--model <ollama-model>]",
-            },
-            CommandSpec {
-                path: &["task", "cleanup"],
-                usage: "task cleanup <task-id> [--force] [--dry-run]",
-            },
-            CommandSpec {
-                path: &["ticket", "list"],
-                usage: "ticket list [--status <status>]",
-            },
-            CommandSpec {
-                path: &["ticket", "get"],
-                usage: "ticket get <ticket-id>",
-            },
-            CommandSpec {
-                path: &["ticket", "resolve"],
-                usage: "ticket resolve <ticket-id> [--model <openai-model>]",
-            },
-            CommandSpec {
-                path: &["resume"],
-                usage: "resume <task-id> [--ticket <ticket-id>] [--max-attempts <n>] [--model <ollama-model>]",
-            },
-            CommandSpec {
-                path: &["run"],
-                usage: "run --title <title> --goal <goal> --validation <cmd>... [--max-attempts <n>] [--model <model>]",
-            },
-            CommandSpec {
-                path: &["config", "get"],
-                usage: "config get",
-            },
-            CommandSpec {
-                path: &["config", "set"],
-                usage: "config set <key> <value>",
-            },
-            CommandSpec {
-                path: &["workspace", "prune"],
-                usage: "workspace prune [--dry-run] [--force]",
-            },
-        ],
+fn clap_command_from_spec(spec: &'static CommandNodeSpec) -> Command {
+    let mut command = Command::new(spec.name).about(spec.about);
+    for alias in spec.aliases {
+        command = command.alias(alias);
+    }
+    if spec.hidden {
+        command = command.hide(true);
+    }
+    for positional in spec.positionals {
+        command = command.arg(clap_arg_from_positional(positional));
+    }
+    for option in spec.options {
+        command = command.arg(clap_arg_from_option(option));
+    }
+    for child in spec.children {
+        command = command.subcommand(clap_command_from_spec(child));
+    }
+    command
+}
+
+fn clap_arg_from_positional(spec: &'static PositionalSpec) -> Arg {
+    let mut arg = Arg::new(spec.name).required(spec.required);
+    for required_unless_present in spec.required_unless_present {
+        arg = arg.required_unless_present(required_unless_present);
+    }
+    for conflict in spec.conflicts_with {
+        arg = arg.conflicts_with(conflict);
+    }
+    if spec.repeatable {
+        arg = arg.action(ArgAction::Append);
+    }
+    apply_value_parser(arg, &spec.value)
+}
+
+fn clap_arg_from_option(spec: &'static OptionSpec) -> Arg {
+    let mut arg = Arg::new(spec.long).long(spec.long).required(spec.required);
+    if let Some(short) = spec.short {
+        arg = arg.short(short);
+    }
+    if let Some(value_name) = spec.value_name {
+        arg = arg.value_name(value_name);
+    }
+    arg = match spec.action {
+        OptionAction::Set => arg.action(ArgAction::Set),
+        OptionAction::SetTrue => arg.action(ArgAction::SetTrue),
+        OptionAction::Append => arg.action(ArgAction::Append),
+    };
+    for required in spec.requires {
+        arg = arg.requires(required);
+    }
+    for conflict in spec.conflicts_with {
+        arg = arg.conflicts_with(conflict);
+    }
+    if let Some(value) = &spec.value {
+        apply_value_parser(arg, value)
+    } else {
+        arg
+    }
+}
+
+fn apply_value_parser(arg: Arg, value: &ValueSpec) -> Arg {
+    match (&value.kind, &value.source) {
+        (_, ValueSource::Static(values)) => {
+            arg.value_parser(PossibleValuesParser::new(values.iter().copied()))
+        }
+        _ => arg,
     }
 }
 
@@ -622,7 +524,7 @@ impl<'a> CommandRuntime<'a> {
         let runtime_options = parsed.options;
         let result = match parsed.command {
             ParsedCommand::Help => CommandResult::with_data(
-                CommandExit::new(CommandStatus::Complete, 0, Some(self.catalog.help())),
+                CommandExit::new(CommandStatus::Complete, 0, Some(self.catalog.help(VERSION))),
                 json!({ "version": VERSION }),
             ),
             ParsedCommand::Version => CommandResult::with_data(
@@ -645,6 +547,16 @@ impl<'a> CommandRuntime<'a> {
                 providers.as_deref(),
                 deep,
             ))),
+            ParsedCommand::Completions { shell } => {
+                match crate::completion::shell::completion_script(shell) {
+                    Ok(script) => CommandResult::new(CommandExit::new(
+                        CommandStatus::Complete,
+                        0,
+                        Some(script),
+                    )),
+                    Err(err) => error_result(err),
+                }
+            }
             ParsedCommand::TaskCreate {
                 title,
                 goal,
@@ -740,6 +652,55 @@ impl<'a> CommandRuntime<'a> {
                     Err(err) => error_result(err),
                 }
             }
+            ParsedCommand::SuperviseTask {
+                task_id,
+                ticket_id,
+                max_attempts,
+                model,
+                ticket_model,
+                max_cycles,
+            } => {
+                let options = SuperviseTaskOptions {
+                    runtime: runtime_options,
+                    ticket_id,
+                    max_attempts,
+                    model,
+                    ticket_model,
+                    max_cycles,
+                };
+                let result = match self
+                    .service
+                    .supervise_task_streaming(&task_id, options, sink)
+                {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                };
+                return finish_sink(sink, result);
+            }
+            ParsedCommand::SuperviseCreate {
+                title,
+                goal,
+                validation,
+                max_attempts,
+                model,
+                ticket_model,
+                max_cycles,
+            } => {
+                let mut options = SuperviseCreateOptions::new(title, goal, validation);
+                options.runtime = runtime_options;
+                options.max_attempts = max_attempts;
+                options.model = model;
+                options.ticket_model = ticket_model;
+                options.max_cycles = max_cycles;
+                let result = match self
+                    .service
+                    .create_and_supervise_task_streaming(options, sink)
+                {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                };
+                return finish_sink(sink, result);
+            }
             ParsedCommand::Run {
                 title,
                 goal,
@@ -790,6 +751,9 @@ pub enum ParsedCommand {
         providers: Option<String>,
         deep: bool,
     },
+    Completions {
+        shell: crate::completion::shell::Shell,
+    },
     TaskCreate {
         title: String,
         goal: String,
@@ -826,6 +790,23 @@ pub enum ParsedCommand {
         ticket_id: Option<TicketId>,
         max_attempts: Option<u32>,
         model: Option<String>,
+    },
+    SuperviseTask {
+        task_id: TaskId,
+        ticket_id: Option<TicketId>,
+        max_attempts: Option<u32>,
+        model: Option<String>,
+        ticket_model: Option<String>,
+        max_cycles: Option<u32>,
+    },
+    SuperviseCreate {
+        title: String,
+        goal: String,
+        validation: Vec<String>,
+        max_attempts: Option<u32>,
+        model: Option<String>,
+        ticket_model: Option<String>,
+        max_cycles: Option<u32>,
     },
     Run {
         title: String,
@@ -903,9 +884,11 @@ impl Parser {
             "-V" | "--version" | "version" => ParsedCommand::Version,
             "init" => ParsedCommand::Init,
             "doctor" => self.parse_doctor()?,
+            "completions" => self.parse_completions()?,
             "task" => self.parse_task()?,
             "ticket" => self.parse_ticket()?,
             "resume" => self.parse_resume()?,
+            "supervise" => self.parse_supervise()?,
             "run" => self.parse_run()?,
             "config" => self.parse_config()?,
             "workspace" => self.parse_workspace()?,
@@ -946,6 +929,12 @@ impl Parser {
         })
     }
 
+    fn parse_completions(&mut self) -> Result<ParsedCommand, ParseFailure> {
+        let shell = self.required_value("shell")?;
+        let shell = crate::completion::shell::Shell::parse(&shell).map_err(ParseFailure::usage)?;
+        Ok(ParsedCommand::Completions { shell })
+    }
+
     fn parse_task(&mut self) -> Result<ParsedCommand, ParseFailure> {
         match self.required_command("task subcommand")?.as_str() {
             "create" => {
@@ -981,7 +970,11 @@ impl Parser {
                 let mut status = None;
                 while let Some(token) = self.next_option_or_none()? {
                     match token.as_str() {
-                        "--status" => status = Some(self.required_value("--status")?),
+                        "--status" => {
+                            let value = self.required_value("--status")?;
+                            validate_task_status(&value)?;
+                            status = Some(value);
+                        }
                         other => {
                             return Err(ParseFailure::usage(format!(
                                 "unknown task list option {other:?}"
@@ -1056,7 +1049,11 @@ impl Parser {
                 let mut status = None;
                 while let Some(token) = self.next_option_or_none()? {
                     match token.as_str() {
-                        "--status" => status = Some(self.required_value("--status")?),
+                        "--status" => {
+                            let value = self.required_value("--status")?;
+                            validate_ticket_status(&value)?;
+                            status = Some(value);
+                        }
                         other => {
                             return Err(ParseFailure::usage(format!(
                                 "unknown ticket list option {other:?}"
@@ -1126,6 +1123,108 @@ impl Parser {
             max_attempts,
             model,
         })
+    }
+
+    fn parse_supervise(&mut self) -> Result<ParsedCommand, ParseFailure> {
+        let mut task_id = None;
+        let mut create = false;
+        let mut title = None;
+        let mut goal = None;
+        let mut validation = Vec::new();
+        let mut ticket_id = None;
+        let mut max_attempts = None;
+        let mut model = None;
+        let mut ticket_model = None;
+        let mut max_cycles = None;
+
+        while let Some(token) = self.next_option_or_none()? {
+            match token.as_str() {
+                "--create" => create = true,
+                "--title" => title = Some(self.required_value("--title")?),
+                "--goal" => goal = Some(self.required_value("--goal")?),
+                "--validation" => validation.push(self.required_value("--validation")?),
+                "--ticket" => {
+                    ticket_id = Some(
+                        TicketId::parse(self.required_value("--ticket")?)
+                            .map_err(|err| ParseFailure::usage(err.to_string()))?,
+                    )
+                }
+                "--max-attempts" => {
+                    max_attempts = Some(parse_u32(
+                        "--max-attempts",
+                        self.required_value("--max-attempts")?,
+                    )?)
+                }
+                "--model" => model = Some(self.required_value("--model")?),
+                "--ticket-model" => ticket_model = Some(self.required_value("--ticket-model")?),
+                "--max-cycles" => {
+                    max_cycles = Some(parse_u32(
+                        "--max-cycles",
+                        self.required_value("--max-cycles")?,
+                    )?)
+                }
+                other if other.starts_with('-') => {
+                    return Err(ParseFailure::usage(format!(
+                        "unknown supervise option {other:?}"
+                    )));
+                }
+                other => {
+                    if task_id.is_some() {
+                        return Err(ParseFailure::usage(format!(
+                            "unexpected argument {other:?}"
+                        )));
+                    }
+                    task_id = Some(
+                        TaskId::parse(other).map_err(|err| ParseFailure::usage(err.to_string()))?,
+                    );
+                }
+            }
+        }
+
+        if create {
+            if task_id.is_some() {
+                return Err(ParseFailure::usage(
+                    "supervise --create cannot be combined with <task-id>",
+                ));
+            }
+            if ticket_id.is_some() {
+                return Err(ParseFailure::usage(
+                    "supervise --create cannot be combined with --ticket",
+                ));
+            }
+            let title = title.ok_or_else(|| ParseFailure::usage("missing --title"))?;
+            let goal = goal.ok_or_else(|| ParseFailure::usage("missing --goal"))?;
+            if validation.is_empty() {
+                return Err(ParseFailure::usage(
+                    "supervise --create requires at least one --validation command",
+                ));
+            }
+            Ok(ParsedCommand::SuperviseCreate {
+                title,
+                goal,
+                validation,
+                max_attempts,
+                model,
+                ticket_model,
+                max_cycles,
+            })
+        } else {
+            if title.is_some() || goal.is_some() || !validation.is_empty() {
+                return Err(ParseFailure::usage(
+                    "supervise create fields require --create",
+                ));
+            }
+            let task_id =
+                task_id.ok_or_else(|| ParseFailure::usage("missing task-id or --create"))?;
+            Ok(ParsedCommand::SuperviseTask {
+                task_id,
+                ticket_id,
+                max_attempts,
+                model,
+                ticket_model,
+                max_cycles,
+            })
+        }
     }
 
     fn parse_run(&mut self) -> Result<ParsedCommand, ParseFailure> {
@@ -1380,6 +1479,18 @@ fn parse_u32(name: &str, value: String) -> Result<u32, ParseFailure> {
         .map_err(|_| ParseFailure::usage(format!("{name} must be a positive integer")))
 }
 
+fn validate_task_status(value: &str) -> Result<(), ParseFailure> {
+    TaskStatus::parse(value)
+        .map(|_| ())
+        .map_err(|err| ParseFailure::usage(err.to_string()))
+}
+
+fn validate_ticket_status(value: &str) -> Result<(), ParseFailure> {
+    TicketStatus::parse(value)
+        .map(|_| ())
+        .map_err(|err| ParseFailure::usage(err.to_string()))
+}
+
 fn finish_sink(sink: &mut dyn OutputSink, result: CommandResult) -> CommandExit {
     let exit = result.exit.clone();
     if let Err(err) = sink.finish(&result) {
@@ -1566,7 +1677,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
+    use std::process::Command as ProcessCommand;
 
     const TASK_ID: &str = "task_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const TICKET_ID: &str = "ticket_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -1594,6 +1705,7 @@ mod tests {
         for expected in [
             "init",
             "doctor",
+            "completions",
             "task create",
             "task list",
             "task get",
@@ -1607,6 +1719,7 @@ mod tests {
             "config get",
             "config set",
             "workspace prune",
+            "supervise",
         ] {
             assert!(paths.iter().any(|path| path == expected), "{expected}");
         }
@@ -1652,6 +1765,7 @@ mod tests {
         let commands = [
             vec!["init", "--repo", "/repo", "--state-dir", "/state"],
             vec!["doctor", "--offline", "--providers", "local", "--deep"],
+            vec!["completions", "bash"],
             vec![
                 "task",
                 "create",
@@ -1703,6 +1817,38 @@ mod tests {
             vec!["config", "get"],
             vec!["config", "set", "providers.ollama.default_model", "coder"],
             vec!["workspace", "prune", "--dry-run", "--force"],
+            vec![
+                "supervise",
+                TASK_ID,
+                "--ticket",
+                TICKET_ID,
+                "--max-attempts",
+                "2",
+                "--model",
+                "m",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ],
+            vec![
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+                "--max-attempts",
+                "2",
+                "--model",
+                "m",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ],
         ];
 
         for command in commands {
@@ -1723,6 +1869,7 @@ mod tests {
                 "all",
                 "--deep",
             ],
+            vec!["harness", "completions", "zsh"],
             vec![
                 "harness",
                 "task",
@@ -1791,10 +1938,382 @@ mod tests {
                 "coder",
             ],
             vec!["harness", "workspace", "prune", "--dry-run", "--force"],
+            vec![
+                "harness",
+                "supervise",
+                TASK_ID,
+                "--ticket",
+                TICKET_ID,
+                "--max-attempts",
+                "2",
+                "--model",
+                "m",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ],
+            vec![
+                "harness",
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+                "--max-attempts",
+                "2",
+                "--model",
+                "m",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ],
         ];
 
         for command in commands {
             assert!(build_clap().try_get_matches_from(command).is_ok());
+        }
+    }
+
+    #[test]
+    fn parser_and_clap_reject_invalid_static_schema_values() {
+        for command in [
+            vec!["task", "list", "--status", "wat"],
+            vec!["ticket", "list", "--status", "wat"],
+            vec!["completions", "powershell"],
+        ] {
+            let err = parse_command(command.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert_eq!(err.into_exit().code(), 2);
+        }
+
+        for command in [
+            vec!["harness", "task", "list", "--status", "wat"],
+            vec!["harness", "ticket", "list", "--status", "wat"],
+            vec!["harness", "completions", "powershell"],
+        ] {
+            assert!(
+                build_clap().try_get_matches_from(command).is_err(),
+                "clap accepted invalid static schema value"
+            );
+        }
+    }
+
+    #[test]
+    fn clap_rejects_invalid_supervise_create_parity_cases() {
+        for command in [
+            vec!["harness", "supervise"],
+            vec![
+                "harness",
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+            ],
+            vec![
+                "harness",
+                "supervise",
+                "--create",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+            ],
+            vec![
+                "harness",
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--validation",
+                "cargo test",
+            ],
+            vec![
+                "harness",
+                "supervise",
+                TASK_ID,
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+            ],
+            vec!["harness", "supervise", TASK_ID, "--title", "Fix"],
+            vec![
+                "harness",
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+                "--ticket",
+                TICKET_ID,
+            ],
+        ] {
+            assert!(
+                build_clap().try_get_matches_from(command.clone()).is_err(),
+                "clap unexpectedly accepted {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_accepts_documented_supervise_forms_and_globals() {
+        let parsed = parse_command(
+            [
+                "--repo=/repo",
+                "--output",
+                "json",
+                "supervise",
+                TASK_ID,
+                "--ticket",
+                TICKET_ID,
+                "--max-attempts",
+                "2",
+                "--model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.options.output, OutputMode::Json);
+        assert_eq!(parsed.options.repo, Some(PathBuf::from("/repo")));
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::SuperviseTask {
+                task_id: TaskId::parse(TASK_ID).unwrap(),
+                ticket_id: Some(TicketId::parse(TICKET_ID).unwrap()),
+                max_attempts: Some(2),
+                model: Some("coder".to_string()),
+                ticket_model: Some("gpt".to_string()),
+                max_cycles: Some(3),
+            }
+        );
+
+        let parsed = parse_command(
+            [
+                "supervise",
+                "--create",
+                "--title",
+                "Fix tests",
+                "--goal",
+                "Make cargo test pass",
+                "--validation",
+                "cargo test",
+                "--validation",
+                "cargo fmt --check",
+                "--max-attempts",
+                "4",
+                "--model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "5",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::SuperviseCreate {
+                title: "Fix tests".to_string(),
+                goal: "Make cargo test pass".to_string(),
+                validation: vec!["cargo test".to_string(), "cargo fmt --check".to_string()],
+                max_attempts: Some(4),
+                model: Some("coder".to_string()),
+                ticket_model: Some("gpt".to_string()),
+                max_cycles: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn parser_rejects_invalid_supervise_forms() {
+        for (command, expected) in [
+            (vec!["supervise"], "missing task-id or --create"),
+            (
+                vec![
+                    "supervise",
+                    "--create",
+                    "--goal",
+                    "Goal",
+                    "--validation",
+                    "cargo test",
+                ],
+                "missing --title",
+            ),
+            (
+                vec![
+                    "supervise",
+                    "--create",
+                    "--title",
+                    "Fix",
+                    "--validation",
+                    "cargo test",
+                ],
+                "missing --goal",
+            ),
+            (
+                vec!["supervise", "--create", "--title", "Fix", "--goal", "Goal"],
+                "--validation",
+            ),
+            (
+                vec![
+                    "supervise",
+                    TASK_ID,
+                    "--create",
+                    "--title",
+                    "Fix",
+                    "--goal",
+                    "Goal",
+                    "--validation",
+                    "cargo test",
+                ],
+                "cannot be combined with <task-id>",
+            ),
+            (
+                vec!["supervise", "--title", "Fix"],
+                "create fields require --create",
+            ),
+        ] {
+            let err = parse_command(command.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert!(
+                err.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn help_catalog_exposes_metadata_and_supervise_surface() {
+        let catalog = build_cli();
+        let help = catalog.help(VERSION);
+
+        assert!(help.contains("supervise <task-id> [--ticket <ticket-id>]"));
+        assert!(
+            help.contains("supervise --create --title <title> --goal <goal> --validation <cmd>..."),
+            "{help}"
+        );
+        assert!(help.contains("INTERACTIVE COMMANDS:"));
+        assert!(help.contains("exit - Exit the interactive UI."));
+        assert!(help.contains("help (aliases: ?) - Show help."));
+
+        let supervise = find_schema_command(&["supervise"]).unwrap();
+        assert_eq!(supervise.action, CommandAction::Placeholder);
+        assert!(supervise.options.iter().any(|option| {
+            option.long == "validation"
+                && option.repeatable
+                && option.action == OptionAction::Append
+                && option
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.kind == ValueKind::FreeText)
+        }));
+        assert!(supervise.options.iter().any(|option| {
+            option.long == "ticket"
+                && option.value.as_ref().is_some_and(|value| {
+                    matches!(
+                        value.source,
+                        ValueSource::StateQuery(StateQueryKind::TicketId {
+                            scoped_to_task_arg: true,
+                            ..
+                        })
+                    )
+                })
+        }));
+    }
+
+    #[test]
+    fn schema_clap_and_parser_command_surface_stay_in_parity() {
+        let tree = phase2_command_tree_seed();
+        let catalog = build_cli();
+        let schema_paths = schema_leaf_paths(tree.commands);
+        let catalog_paths = catalog
+            .commands()
+            .iter()
+            .map(|command| command.path.clone())
+            .collect::<Vec<_>>();
+
+        for path in &schema_paths {
+            assert!(
+                catalog_paths
+                    .iter()
+                    .any(|catalog_path| catalog_path == path),
+                "catalog missing schema path {path:?}"
+            );
+            assert!(
+                clap_path_exists(&build_clap(), path),
+                "clap missing schema path {path:?}"
+            );
+        }
+
+        let clap_tree = build_clap();
+        for option in tree.globals {
+            let arg = clap_tree
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some(option.long))
+                .unwrap_or_else(|| panic!("missing global option {}", option.long));
+            assert_eq!(
+                clap_action_name(arg.get_action()),
+                option_action_name(option.action)
+            );
+            assert_eq!(arg.is_required_set(), option.required);
+        }
+
+        for path in schema_paths {
+            let schema = find_schema_command(&path).unwrap();
+            let clap = find_clap_command(&clap_tree, &path).unwrap();
+            for positional in schema.positionals {
+                let arg = clap
+                    .get_arguments()
+                    .find(|arg| arg.get_id().as_str() == positional.name)
+                    .unwrap_or_else(|| panic!("missing positional {:?} on {path:?}", positional));
+                assert_eq!(arg.is_required_set(), positional.required);
+            }
+            for option in schema.options {
+                let arg = clap
+                    .get_arguments()
+                    .find(|arg| arg.get_long() == Some(option.long))
+                    .unwrap_or_else(|| panic!("missing option {} on {path:?}", option.long));
+                assert_eq!(
+                    clap_action_name(arg.get_action()),
+                    option_action_name(option.action)
+                );
+                assert_eq!(arg.is_required_set(), option.required);
+                assert_eq!(
+                    clap_action_name(arg.get_action()) == "append",
+                    option.repeatable,
+                    "repeatability mismatch for --{} on {path:?}",
+                    option.long
+                );
+                assert!(
+                    option.value.is_some() == option.value_name.is_some(),
+                    "value metadata mismatch for --{} on {path:?}",
+                    option.long
+                );
+            }
         }
     }
 
@@ -1894,6 +2413,48 @@ mod tests {
         assert_eq!(value["exit_code"], 0);
         assert_eq!(value["data"]["task_id"], TASK_ID);
         assert!(stderr.contains("running task"));
+    }
+
+    #[test]
+    fn json_sink_writes_supervisor_progress_as_ndjson_to_stderr() {
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+
+        let exit = runtime.dispatch(["supervise", TASK_ID, "--output", "json"], &mut sink);
+
+        assert_eq!(exit.code(), 0);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        let stdout_lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(stdout_lines.len(), 1, "{stdout:?}");
+        let stderr_lines = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(stderr_lines.len(), 1, "{stderr:?}");
+        let event: Value = serde_json::from_str(stderr_lines[0]).unwrap();
+        assert_eq!(event["event"], "supervise.phase");
+        assert_eq!(event["phase"], "inspect");
+        assert_eq!(event["task_id"], TASK_ID);
+        assert_eq!(event["message"], "inspecting task");
+        let final_object: Value = serde_json::from_str(stdout_lines[0]).unwrap();
+        assert_eq!(final_object["status"], "complete");
+        assert_eq!(final_object["data"]["task_id"], TASK_ID);
+    }
+
+    #[test]
+    fn json_sink_quiet_suppresses_info_supervisor_progress_ndjson() {
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, true);
+
+        let exit = runtime.dispatch(["supervise", TASK_ID, "--output", "json"], &mut sink);
+
+        assert_eq!(exit.code(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(String::from_utf8(stdout).unwrap().lines().count(), 1);
     }
 
     #[test]
@@ -2015,6 +2576,83 @@ mod tests {
     }
 
     #[test]
+    fn supervise_dispatch_passes_options_to_service_placeholders() {
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = HumanSink::new(&mut stdout, &mut stderr, true);
+
+        let exit = runtime.dispatch(
+            [
+                "--repo",
+                "/repo",
+                "supervise",
+                TASK_ID,
+                "--ticket",
+                TICKET_ID,
+                "--max-attempts",
+                "2",
+                "--model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "3",
+            ],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+
+        let calls = service.supervise_requests.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.as_str(), TASK_ID);
+        assert_eq!(calls[0].1.runtime.repo, Some(PathBuf::from("/repo")));
+        assert_eq!(
+            calls[0].1.ticket_id.as_ref().map(TicketId::as_str),
+            Some(TICKET_ID)
+        );
+        assert_eq!(calls[0].1.max_attempts, Some(2));
+        assert_eq!(calls[0].1.model.as_deref(), Some("coder"));
+        assert_eq!(calls[0].1.ticket_model.as_deref(), Some("gpt"));
+        assert_eq!(calls[0].1.max_cycles, Some(3));
+
+        let mut sink = HumanSink::new(&mut stdout, &mut stderr, true);
+        let exit = runtime.dispatch(
+            [
+                "supervise",
+                "--create",
+                "--title",
+                "Fix",
+                "--goal",
+                "Goal",
+                "--validation",
+                "cargo test",
+                "--max-attempts",
+                "4",
+                "--model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-cycles",
+                "5",
+            ],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+
+        let calls = service.supervise_create_requests.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].title, "Fix");
+        assert_eq!(calls[0].goal, "Goal");
+        assert_eq!(calls[0].validation_commands, ["cargo test"]);
+        assert_eq!(calls[0].max_attempts, Some(4));
+        assert_eq!(calls[0].model.as_deref(), Some("coder"));
+        assert_eq!(calls[0].ticket_model.as_deref(), Some("gpt"));
+        assert_eq!(calls[0].max_cycles, Some(5));
+    }
+
+    #[test]
     fn doctor_readiness_failures_return_exit_code_20() {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_doctor_runtime_repo(temp.path().join("repo"));
@@ -2057,6 +2695,81 @@ mod tests {
         );
     }
 
+    fn schema_leaf_paths(nodes: &'static [CommandNodeSpec]) -> Vec<Vec<&'static str>> {
+        fn collect(
+            nodes: &'static [CommandNodeSpec],
+            prefix: Vec<&'static str>,
+            paths: &mut Vec<Vec<&'static str>>,
+        ) {
+            for node in nodes {
+                let mut path = prefix.clone();
+                path.push(node.name);
+                if node.children.is_empty() {
+                    paths.push(path);
+                } else {
+                    collect(node.children, path, paths);
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        collect(nodes, Vec::new(), &mut paths);
+        paths
+    }
+
+    fn find_schema_command(path: &[&str]) -> Option<&'static CommandNodeSpec> {
+        fn find(
+            nodes: &'static [CommandNodeSpec],
+            path: &[&str],
+        ) -> Option<&'static CommandNodeSpec> {
+            let (head, tail) = path.split_first()?;
+            let node = nodes.iter().find(|node| node.name == *head)?;
+            if tail.is_empty() {
+                Some(node)
+            } else {
+                find(node.children, tail)
+            }
+        }
+
+        find(phase2_command_tree_seed().commands, path)
+    }
+
+    fn clap_path_exists(command: &clap::Command, path: &[&str]) -> bool {
+        find_clap_command(command, path).is_some()
+    }
+
+    fn find_clap_command<'a>(
+        command: &'a clap::Command,
+        path: &[&str],
+    ) -> Option<&'a clap::Command> {
+        let (head, tail) = path.split_first()?;
+        let child = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == *head)?;
+        if tail.is_empty() {
+            Some(child)
+        } else {
+            find_clap_command(child, tail)
+        }
+    }
+
+    fn option_action_name(action: OptionAction) -> &'static str {
+        match action {
+            OptionAction::Set => "set",
+            OptionAction::SetTrue => "set_true",
+            OptionAction::Append => "append",
+        }
+    }
+
+    fn clap_action_name(action: &ArgAction) -> &'static str {
+        match format!("{action:?}").as_str() {
+            "Set" => "set",
+            "SetTrue" => "set_true",
+            "Append" => "append",
+            other => panic!("unexpected clap action {other}"),
+        }
+    }
+
     fn init_doctor_runtime_repo(repo: PathBuf) -> PathBuf {
         fs::create_dir_all(&repo).unwrap();
         run_doctor_runtime_git(&repo, &["init"]);
@@ -2069,7 +2782,7 @@ mod tests {
     }
 
     fn run_doctor_runtime_git(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = ProcessCommand::new("git")
             .args(args)
             .current_dir(repo)
             .output()
@@ -2088,6 +2801,8 @@ mod tests {
         run_requests: RefCell<Vec<(TaskId, TaskRunOptions)>>,
         resolve_requests: RefCell<Vec<(TicketId, TicketResolveOptions)>>,
         resume_requests: RefCell<Vec<(TaskId, ResumeTaskOptions)>>,
+        supervise_requests: RefCell<Vec<(TaskId, SuperviseTaskOptions)>>,
+        supervise_create_requests: RefCell<Vec<SuperviseCreateOptions>>,
     }
 
     impl HarnessService for FakeService {
@@ -2194,6 +2909,44 @@ mod tests {
                 .borrow_mut()
                 .push((task_id.clone(), options));
             Ok(CommandResult::new(CommandExit::success()))
+        }
+
+        fn supervise_task(
+            &self,
+            task_id: &TaskId,
+            options: SuperviseTaskOptions,
+        ) -> HarnessResult<CommandResult> {
+            self.supervise_requests
+                .borrow_mut()
+                .push((task_id.clone(), options));
+            let progress = SuperviseProgressEvent {
+                phase: SuperviseProgressPhase::InspectTask,
+                task_id: Some(task_id.clone()),
+                run_id: None,
+                ticket_id: None,
+                cycle: Some(0),
+                message: "inspecting task".to_string(),
+                next_command: Some(format!("harness task get {} --output json", task_id)),
+            };
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({ "task_id": task_id.as_str() }),
+            )
+            .with_event(CommandEvent::supervise_progress(
+                progress,
+                CommandEventLevel::Info,
+            )))
+        }
+
+        fn create_and_supervise_task(
+            &self,
+            options: SuperviseCreateOptions,
+        ) -> HarnessResult<CommandResult> {
+            self.supervise_create_requests.borrow_mut().push(options);
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({ "task_id": TASK_ID }),
+            ))
         }
     }
 }

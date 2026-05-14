@@ -6,14 +6,26 @@ use crate::runtime::{
     TaskRunOptions, TicketResolveOptions,
 };
 use crate::service::{DefaultHarnessService, HarnessService};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub fn run<I, S>(args: I) -> CommandExit
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let tokens = args.iter().skip(1).cloned().collect::<Vec<_>>();
+    if tokens.is_empty()
+        && no_command_route(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) == NoCommandRoute::Tui
+    {
+        return crate::tui::run_tui(command_service_factory(Vec::new()));
+    }
+
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     let stdin = std::io::stdin();
@@ -60,6 +72,24 @@ fn command_service(tokens: &[String]) -> Box<dyn HarnessService> {
             Err(error) => Box::new(PlaceholderService::with_error(error)),
         },
         Err(error) => Box::new(PlaceholderService::with_error(error)),
+    }
+}
+
+fn command_service_factory(tokens: Vec<String>) -> crate::tui::RuntimeServiceFactory {
+    Arc::new(move || command_service(&tokens))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoCommandRoute {
+    Tui,
+    FallbackInteractive,
+}
+
+fn no_command_route(stdin_is_tty: bool, stdout_is_tty: bool) -> NoCommandRoute {
+    if stdin_is_tty && stdout_is_tty {
+        NoCommandRoute::Tui
+    } else {
+        NoCommandRoute::FallbackInteractive
     }
 }
 
@@ -239,6 +269,19 @@ mod tests {
         assert!(stdout.contains("interactive mode"));
         assert!(stdout.contains(&format!("harness {}", env!("CARGO_PKG_VERSION"))));
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn cli_no_command_route_uses_tui_only_for_tty_input_and_output() {
+        assert_eq!(no_command_route(true, true), NoCommandRoute::Tui);
+        assert_eq!(
+            no_command_route(false, true),
+            NoCommandRoute::FallbackInteractive
+        );
+        assert_eq!(
+            no_command_route(true, false),
+            NoCommandRoute::FallbackInteractive
+        );
     }
 
     #[test]

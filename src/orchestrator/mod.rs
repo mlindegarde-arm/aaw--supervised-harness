@@ -1,3 +1,6 @@
+pub mod supervisor;
+pub mod supervisor_state;
+
 use crate::domain::{
     Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus, Event, EventId, EventLevel,
     HarnessConfig, Run, RunId, RunStatus, Task, TaskId, TaskStatus, Ticket, TicketId,
@@ -1313,8 +1316,7 @@ impl RunOrchestrator {
                     "ticket does not belong to task".to_string(),
                 ));
             }
-            self.store
-                .latest_unconsumed_resolution_for_ticket(ticket_id)?
+            TaskStore::latest_unconsumed_resolution_for_ticket(self.store.as_ref(), ticket_id)?
         } else {
             let run =
                 self.store

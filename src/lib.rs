@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod completion;
 pub mod config;
 pub mod doctor;
 pub mod domain;
@@ -12,6 +13,7 @@ pub mod runtime;
 pub mod security;
 pub mod service;
 pub mod state;
+pub mod tui;
 pub mod workspace;
 
 pub use error::{HarnessError, HarnessResult};
