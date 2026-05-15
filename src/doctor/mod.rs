@@ -683,7 +683,7 @@ fn tiny_request(model: &str) -> ModelRequest {
         system: Some("Diagnostic readiness check. Reply briefly.".to_string()),
         input: "Reply with ok.".to_string(),
         temperature: Some(0.0),
-        max_output_tokens: Some(8),
+        max_output_tokens: Some(16),
         metadata: BTreeMap::from([("diagnostic".to_string(), "doctor".to_string())]),
     }
 }
@@ -897,7 +897,7 @@ mod tests {
             .unwrap()
             .json_body()
             .unwrap();
-        assert_eq!(ollama_generate["options"]["num_predict"], 8);
+        assert_eq!(ollama_generate["options"]["num_predict"], 16);
         let openai_response = openai
             .requests()
             .into_iter()
@@ -905,7 +905,7 @@ mod tests {
             .unwrap()
             .json_body()
             .unwrap();
-        assert_eq!(openai_response["max_output_tokens"], 8);
+        assert_eq!(openai_response["max_output_tokens"], 16);
     }
 
     #[test]

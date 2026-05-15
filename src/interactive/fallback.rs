@@ -1,6 +1,7 @@
 use crate::completion::{
-    CompleterEngine, CompletionContext, CompletionEngine, CompletionStateView, TaskCompletionItem,
-    TaskCompletionScope, TicketCompletionItem, TicketCompletionScope,
+    CompleterEngine, CompletionContext, CompletionEngine, CompletionStateView,
+    ObjectiveCompletionItem, ObjectiveCompletionScope, TaskCompletionItem, TaskCompletionScope,
+    TicketCompletionItem, TicketCompletionScope,
 };
 use crate::error::{HarnessError, HarnessResult};
 use crate::runtime::{CommandCatalog, CommandExit, CommandRuntime, InteractiveSink, build_cli};
@@ -167,6 +168,13 @@ impl CompletionStateView for EmptyCompletionStateView {
         &self,
         _scope: TicketCompletionScope,
     ) -> HarnessResult<Vec<TicketCompletionItem>> {
+        Ok(Vec::new())
+    }
+
+    fn objectives_for_completion(
+        &self,
+        _scope: ObjectiveCompletionScope,
+    ) -> HarnessResult<Vec<ObjectiveCompletionItem>> {
         Ok(Vec::new())
     }
 }
@@ -798,6 +806,13 @@ mod tests {
                 status: TicketStatus::Open,
                 summary: "Need help".to_string(),
             }])
+        }
+
+        fn objectives_for_completion(
+            &self,
+            _scope: ObjectiveCompletionScope,
+        ) -> HarnessResult<Vec<ObjectiveCompletionItem>> {
+            Ok(Vec::new())
         }
     }
 

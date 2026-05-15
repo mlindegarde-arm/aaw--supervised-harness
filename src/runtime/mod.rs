@@ -3,7 +3,9 @@ pub mod events;
 pub mod supervise;
 
 use crate::doctor::{DiagnosticStatus, DoctorOptions, DoctorReport};
-use crate::domain::{Task, TaskId, TaskStatus, Ticket, TicketId, TicketStatus};
+use crate::domain::{
+    ObjectiveId, ObjectiveStatus, Task, TaskId, TaskStatus, Ticket, TicketId, TicketStatus,
+};
 use crate::error::{HarnessError, HarnessResult};
 use crate::service::HarnessService;
 use crate::state::SqliteTaskStore;
@@ -19,6 +21,7 @@ pub use catalog::{
     ValueKind, ValueSource, ValueSpec, build_cli, phase2_command_tree_seed,
 };
 pub use events::{
+    CommandEventEnvelope, ObjectiveProgressEvent, ObjectiveProgressKind, ObjectiveProgressPhase,
     PaneArtifactRow, PaneRunRow, PaneSection, PaneStateSnapshot, PaneTaskRow, PaneTicketRow,
     SuperviseProgressEvent, SuperviseProgressPhase, TranscriptEvent, TuiRuntimeEvent,
 };
@@ -132,12 +135,13 @@ impl CommandResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandEvent {
     pub kind: String,
     pub level: CommandEventLevel,
     pub message: String,
     pub supervise_progress: Option<SuperviseProgressEvent>,
+    pub objective_progress: Option<ObjectiveProgressEvent>,
 }
 
 impl CommandEvent {
@@ -147,6 +151,7 @@ impl CommandEvent {
             level: CommandEventLevel::Info,
             message: message.into(),
             supervise_progress: None,
+            objective_progress: None,
         }
     }
 
@@ -156,6 +161,7 @@ impl CommandEvent {
             level: CommandEventLevel::Warn,
             message: message.into(),
             supervise_progress: None,
+            objective_progress: None,
         }
     }
 
@@ -165,6 +171,7 @@ impl CommandEvent {
             level: CommandEventLevel::Error,
             message: message.into(),
             supervise_progress: None,
+            objective_progress: None,
         }
     }
 
@@ -174,7 +181,33 @@ impl CommandEvent {
             level,
             message: event.message.clone(),
             supervise_progress: Some(event),
+            objective_progress: None,
         }
+    }
+
+    pub fn objective_progress(event: ObjectiveProgressEvent, level: CommandEventLevel) -> Self {
+        Self {
+            kind: event.kind.as_str().to_string(),
+            level,
+            message: event.message.clone(),
+            supervise_progress: None,
+            objective_progress: Some(event),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        if let Some(progress) = &self.objective_progress {
+            return progress.to_json(self.level);
+        }
+        if let Some(progress) = &self.supervise_progress {
+            return progress.to_json();
+        }
+        json!({
+            "event": self.kind,
+            "schema_version": 1,
+            "level": self.level.as_str(),
+            "message": self.message,
+        })
     }
 }
 
@@ -271,20 +304,10 @@ impl OutputSink for JsonSink<'_> {
             return Ok(());
         }
 
-        if let Some(progress) = &event.supervise_progress {
-            serde_json::to_writer(&mut self.stderr, &progress.to_json()).map_err(|err| {
-                HarnessError::External(format!("failed to write JSON event output: {err}"))
-            })?;
-            writeln!(self.stderr).map_err(io_error)
-        } else {
-            writeln!(
-                self.stderr,
-                "{}: {}",
-                event.level.as_str(),
-                event.message.trim_end()
-            )
-            .map_err(io_error)
-        }
+        serde_json::to_writer(&mut self.stderr, &event.to_json()).map_err(|err| {
+            HarnessError::External(format!("failed to write JSON event output: {err}"))
+        })?;
+        writeln!(self.stderr).map_err(io_error)
     }
 
     fn finish(&mut self, result: &CommandResult) -> HarnessResult<()> {
@@ -398,6 +421,33 @@ pub struct ResumeTaskOptions {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveStartOptions {
+    pub runtime: RuntimeOptions,
+    pub prompt: ObjectivePromptInput,
+    pub supervise: bool,
+    pub planner_model: Option<String>,
+    pub worker_model: Option<String>,
+    pub ticket_model: Option<String>,
+    pub max_worker_attempts: Option<u32>,
+    pub max_cycles: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveSuperviseOptions {
+    pub runtime: RuntimeOptions,
+    pub worker_model: Option<String>,
+    pub ticket_model: Option<String>,
+    pub max_worker_attempts: Option<u32>,
+    pub max_cycles: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveValidateOptions {
+    pub runtime: RuntimeOptions,
+    pub dry_run: bool,
+}
+
 pub fn build_clap() -> Command {
     let tree = phase2_command_tree_seed();
     let mut command = Command::new(tree.name)
@@ -442,7 +492,7 @@ fn clap_arg_from_positional(spec: &'static PositionalSpec) -> Arg {
         arg = arg.conflicts_with(conflict);
     }
     if spec.repeatable {
-        arg = arg.action(ArgAction::Append);
+        arg = arg.action(ArgAction::Append).num_args(1..);
     }
     apply_value_parser(arg, &spec.value)
 }
@@ -635,6 +685,105 @@ impl<'a> CommandRuntime<'a> {
                     Err(err) => error_result(err),
                 }
             }
+            ParsedCommand::ObjectiveStart {
+                prompt,
+                supervise,
+                planner_model,
+                worker_model,
+                ticket_model,
+                max_worker_attempts,
+                max_cycles,
+            } => {
+                let options = ObjectiveStartOptions {
+                    runtime: runtime_options,
+                    prompt,
+                    supervise,
+                    planner_model,
+                    worker_model,
+                    ticket_model,
+                    max_worker_attempts,
+                    max_cycles,
+                };
+                let result = match self.service.start_objective_streaming(options, sink) {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                };
+                return finish_sink(sink, result);
+            }
+            ParsedCommand::ObjectiveList { status } => {
+                match status.as_deref().map(ObjectiveStatus::parse).transpose() {
+                    Ok(status) => match self.service.list_objectives(status) {
+                        Ok(objectives) => CommandResult::with_data(
+                            CommandExit::new(
+                                CommandStatus::Complete,
+                                0,
+                                Some(format!("{} objective(s)", objectives.len())),
+                            ),
+                            json!({
+                                "objectives": objectives.iter().map(objective_json).collect::<Vec<_>>(),
+                                "next": "harness objective get <objective-id>",
+                            }),
+                        ),
+                        Err(err) => error_result(err),
+                    },
+                    Err(err) => error_result(err),
+                }
+            }
+            ParsedCommand::ObjectiveGet { objective_id } => {
+                match self.service.get_objective(&objective_id) {
+                    Ok(objective) => objective_result(objective),
+                    Err(err) => error_result(err),
+                }
+            }
+            ParsedCommand::ObjectivePlan { objective_id } => {
+                match self.service.get_objective_plan(&objective_id) {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                }
+            }
+            ParsedCommand::ObjectiveValidate {
+                objective_id,
+                dry_run,
+            } => {
+                let options = ObjectiveValidateOptions {
+                    runtime: runtime_options,
+                    dry_run,
+                };
+                match self.service.validate_objective(&objective_id, options) {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                }
+            }
+            ParsedCommand::ObjectiveSupervise {
+                objective_id,
+                worker_model,
+                ticket_model,
+                max_worker_attempts,
+                max_cycles,
+            } => {
+                let options = ObjectiveSuperviseOptions {
+                    runtime: runtime_options,
+                    worker_model,
+                    ticket_model,
+                    max_worker_attempts,
+                    max_cycles,
+                };
+                let result =
+                    match self
+                        .service
+                        .supervise_objective_streaming(&objective_id, options, sink)
+                    {
+                        Ok(result) => result,
+                        Err(err) => error_result(err),
+                    };
+                return finish_sink(sink, result);
+            }
+            ParsedCommand::ObjectiveCancel { objective_id } => {
+                match self.service.cancel_objective(&objective_id) {
+                    Ok(result) => result,
+                    Err(err) => error_result(err),
+                }
+            }
             ParsedCommand::Resume {
                 task_id,
                 ticket_id,
@@ -785,6 +934,38 @@ pub enum ParsedCommand {
         ticket_id: TicketId,
         model: Option<String>,
     },
+    ObjectiveStart {
+        prompt: ObjectivePromptInput,
+        supervise: bool,
+        planner_model: Option<String>,
+        worker_model: Option<String>,
+        ticket_model: Option<String>,
+        max_worker_attempts: Option<u32>,
+        max_cycles: Option<u32>,
+    },
+    ObjectiveList {
+        status: Option<String>,
+    },
+    ObjectiveGet {
+        objective_id: ObjectiveId,
+    },
+    ObjectivePlan {
+        objective_id: ObjectiveId,
+    },
+    ObjectiveValidate {
+        objective_id: ObjectiveId,
+        dry_run: bool,
+    },
+    ObjectiveSupervise {
+        objective_id: ObjectiveId,
+        worker_model: Option<String>,
+        ticket_model: Option<String>,
+        max_worker_attempts: Option<u32>,
+        max_cycles: Option<u32>,
+    },
+    ObjectiveCancel {
+        objective_id: ObjectiveId,
+    },
     Resume {
         task_id: TaskId,
         ticket_id: Option<TicketId>,
@@ -824,6 +1005,13 @@ pub enum ParsedCommand {
         dry_run: bool,
         force: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectivePromptInput {
+    Text(String),
+    File(PathBuf),
+    Stdin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,6 +1075,7 @@ impl Parser {
             "completions" => self.parse_completions()?,
             "task" => self.parse_task()?,
             "ticket" => self.parse_ticket()?,
+            "objective" => self.parse_objective()?,
             "resume" => self.parse_resume()?,
             "supervise" => self.parse_supervise()?,
             "run" => self.parse_run()?,
@@ -1087,6 +1276,169 @@ impl Parser {
                 "unknown ticket subcommand {other:?}"
             ))),
         }
+    }
+
+    fn parse_objective(&mut self) -> Result<ParsedCommand, ParseFailure> {
+        match self.required_command("objective subcommand")?.as_str() {
+            "start" => self.parse_objective_start(),
+            "list" => {
+                let mut status = None;
+                while let Some(token) = self.next_option_or_none()? {
+                    if let Some(value) = self.option_value(&token, "--status")? {
+                        validate_objective_status(&value)?;
+                        status = Some(value);
+                    } else {
+                        return Err(ParseFailure::usage(format!(
+                            "unknown objective list option {token:?}"
+                        )));
+                    }
+                }
+                Ok(ParsedCommand::ObjectiveList { status })
+            }
+            "get" => Ok(ParsedCommand::ObjectiveGet {
+                objective_id: parse_objective_id(self.required_value("objective-id")?)?,
+            }),
+            "plan" => Ok(ParsedCommand::ObjectivePlan {
+                objective_id: parse_objective_id(self.required_value("objective-id")?)?,
+            }),
+            "validate" => {
+                let objective_id = parse_objective_id(self.required_value("objective-id")?)?;
+                let mut dry_run = false;
+                while let Some(token) = self.next_option_or_none()? {
+                    match token.as_str() {
+                        "--dry-run" => dry_run = true,
+                        other => {
+                            return Err(ParseFailure::usage(format!(
+                                "unknown objective validate option {other:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(ParsedCommand::ObjectiveValidate {
+                    objective_id,
+                    dry_run,
+                })
+            }
+            "supervise" => {
+                let objective_id = parse_objective_id(self.required_value("objective-id")?)?;
+                let mut worker_model = None;
+                let mut ticket_model = None;
+                let mut max_worker_attempts = None;
+                let mut max_cycles = None;
+                while let Some(token) = self.next_option_or_none()? {
+                    if let Some(value) = self.option_value(&token, "--worker-model")? {
+                        worker_model = Some(value);
+                    } else if let Some(value) = self.option_value(&token, "--ticket-model")? {
+                        ticket_model = Some(value);
+                    } else if let Some(value) =
+                        self.option_value(&token, "--max-worker-attempts")?
+                    {
+                        max_worker_attempts = Some(parse_u32("--max-worker-attempts", value)?);
+                    } else if let Some(value) = self.option_value(&token, "--max-cycles")? {
+                        max_cycles = Some(parse_u32("--max-cycles", value)?);
+                    } else {
+                        return Err(ParseFailure::usage(format!(
+                            "unknown objective supervise option {token:?}"
+                        )));
+                    }
+                }
+                Ok(ParsedCommand::ObjectiveSupervise {
+                    objective_id,
+                    worker_model,
+                    ticket_model,
+                    max_worker_attempts,
+                    max_cycles,
+                })
+            }
+            "cancel" => Ok(ParsedCommand::ObjectiveCancel {
+                objective_id: parse_objective_id(self.required_value("objective-id")?)?,
+            }),
+            other => Err(ParseFailure::usage(format!(
+                "unknown objective subcommand {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_objective_start(&mut self) -> Result<ParsedCommand, ParseFailure> {
+        let mut prompt = None;
+        let mut prompt_file = None;
+        let mut stdin = false;
+        let mut prompt_words = Vec::new();
+        let mut supervise = false;
+        let mut planner_model = None;
+        let mut worker_model = None;
+        let mut ticket_model = None;
+        let mut max_worker_attempts = None;
+        let mut max_cycles = None;
+
+        while let Some(token) = self.next_option_or_none()? {
+            if let Some(value) = self.option_value(&token, "--prompt")? {
+                prompt = Some(value);
+            } else if let Some(value) = self.option_value(&token, "--prompt-file")? {
+                prompt_file = Some(PathBuf::from(value));
+            } else if token == "--stdin" {
+                stdin = true;
+            } else if token == "--supervise" {
+                supervise = true;
+            } else if let Some(value) = self.option_value(&token, "--planner-model")? {
+                planner_model = Some(value);
+            } else if let Some(value) = self.option_value(&token, "--worker-model")? {
+                worker_model = Some(value);
+            } else if let Some(value) = self.option_value(&token, "--ticket-model")? {
+                ticket_model = Some(value);
+            } else if let Some(value) = self.option_value(&token, "--max-worker-attempts")? {
+                max_worker_attempts = Some(parse_u32("--max-worker-attempts", value)?);
+            } else if let Some(value) = self.option_value(&token, "--max-cycles")? {
+                max_cycles = Some(parse_u32("--max-cycles", value)?);
+            } else if token.starts_with('-') {
+                return Err(ParseFailure::usage(format!(
+                    "unknown objective start option {token:?}"
+                )));
+            } else {
+                prompt_words.push(token);
+                while let Some(token) = self.next_raw() {
+                    prompt_words.push(token);
+                }
+                break;
+            }
+        }
+
+        let positional_prompt = (!prompt_words.is_empty()).then(|| prompt_words.join(" "));
+        let trailing_prompt_contains_prompt_source = prompt_words
+            .iter()
+            .any(|word| matches!(word.as_str(), "--prompt" | "--prompt-file" | "--stdin"));
+        let prompt_sources = usize::from(positional_prompt.is_some())
+            + usize::from(prompt.is_some())
+            + usize::from(prompt_file.is_some())
+            + usize::from(stdin);
+        if prompt_sources == 0 {
+            return Err(ParseFailure::usage(
+                "objective start requires a prompt, --prompt, --prompt-file, or --stdin",
+            ));
+        }
+        if prompt_sources > 1 || trailing_prompt_contains_prompt_source {
+            return Err(ParseFailure::usage(
+                "objective prompt inputs conflict; use only one of trailing prompt, --prompt, --prompt-file, or --stdin",
+            ));
+        }
+
+        let prompt = if let Some(prompt) = positional_prompt.or(prompt) {
+            ObjectivePromptInput::Text(prompt)
+        } else if let Some(path) = prompt_file {
+            ObjectivePromptInput::File(path)
+        } else {
+            ObjectivePromptInput::Stdin
+        };
+
+        Ok(ParsedCommand::ObjectiveStart {
+            prompt,
+            supervise,
+            planner_model,
+            worker_model,
+            ticket_model,
+            max_worker_attempts,
+            max_cycles,
+        })
     }
 
     fn parse_resume(&mut self) -> Result<ParsedCommand, ParseFailure> {
@@ -1335,6 +1687,24 @@ impl Parser {
         }
     }
 
+    fn option_value(
+        &mut self,
+        token: &str,
+        option: &'static str,
+    ) -> Result<Option<String>, ParseFailure> {
+        if token == option {
+            return Ok(Some(self.required_value(option)?));
+        }
+        let prefix = format!("{option}=");
+        if let Some(value) = token.strip_prefix(&prefix) {
+            if value.is_empty() {
+                return Err(ParseFailure::usage(format!("missing value for {option}")));
+            }
+            return Ok(Some(value.to_string()));
+        }
+        Ok(None)
+    }
+
     fn required_value(&mut self, name: &str) -> Result<String, ParseFailure> {
         loop {
             let Some(token) = self.next_raw() else {
@@ -1491,6 +1861,16 @@ fn validate_ticket_status(value: &str) -> Result<(), ParseFailure> {
         .map_err(|err| ParseFailure::usage(err.to_string()))
 }
 
+fn validate_objective_status(value: &str) -> Result<(), ParseFailure> {
+    ObjectiveStatus::parse(value)
+        .map(|_| ())
+        .map_err(|err| ParseFailure::usage(err.to_string()))
+}
+
+fn parse_objective_id(value: String) -> Result<ObjectiveId, ParseFailure> {
+    ObjectiveId::parse(value).map_err(|err| ParseFailure::usage(err.to_string()))
+}
+
 fn finish_sink(sink: &mut dyn OutputSink, result: CommandResult) -> CommandExit {
     let exit = result.exit.clone();
     if let Err(err) = sink.finish(&result) {
@@ -1616,6 +1996,21 @@ fn ticket_result(ticket: Ticket) -> CommandResult {
     )
 }
 
+fn objective_result(objective: crate::state::Objective) -> CommandResult {
+    CommandResult::with_data(
+        CommandExit::new(
+            CommandStatus::Complete,
+            0,
+            Some(format!("objective {}", objective.id.as_str())),
+        ),
+        json!({
+            "objective_id": objective.id.as_str(),
+            "objective": objective_json(&objective),
+            "next": format!("harness objective supervise {}", objective.id.as_str()),
+        }),
+    )
+}
+
 fn filter_tasks(tasks: Vec<Task>, status: Option<&str>) -> Vec<Task> {
     match status.and_then(|status| TaskStatus::parse(status).ok()) {
         Some(status) => tasks
@@ -1668,6 +2063,22 @@ fn ticket_json(ticket: &Ticket) -> Value {
     })
 }
 
+fn objective_json(objective: &crate::state::Objective) -> Value {
+    json!({
+        "id": objective.id.as_str(),
+        "title": objective.title,
+        "prompt": objective.prompt,
+        "summary": objective.summary,
+        "status": objective.status.as_str(),
+        "planner_model": objective.planner_model,
+        "worker_model": objective.worker_model,
+        "ticket_model": objective.ticket_model,
+        "active_plan_id": objective.active_plan_id.as_ref().map(crate::domain::ObjectivePlanId::as_str),
+        "created_at": objective.created_at,
+        "updated_at": objective.updated_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1681,6 +2092,7 @@ mod tests {
 
     const TASK_ID: &str = "task_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const TICKET_ID: &str = "ticket_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const OBJECTIVE_ID: &str = "objective_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
     #[test]
     fn command_exit_codes_match_design() {
@@ -1714,6 +2126,13 @@ mod tests {
             "ticket list",
             "ticket get",
             "ticket resolve",
+            "objective start",
+            "objective list",
+            "objective get",
+            "objective plan",
+            "objective validate",
+            "objective supervise",
+            "objective cancel",
             "resume",
             "run",
             "config get",
@@ -1791,6 +2210,44 @@ mod tests {
             vec!["ticket", "list", "--status", "open"],
             vec!["ticket", "get", TICKET_ID],
             vec!["ticket", "resolve", TICKET_ID, "--model", "gpt"],
+            vec![
+                "objective",
+                "start",
+                "--prompt",
+                "Build the thing",
+                "--supervise",
+                "--planner-model",
+                "gpt",
+                "--worker-model",
+                "coder",
+                "--ticket-model",
+                "gpt-ticket",
+                "--max-worker-attempts",
+                "4",
+                "--max-cycles",
+                "5",
+            ],
+            vec!["objective", "start", "Build", "the", "thing"],
+            vec!["objective", "start", "--prompt-file", "/tmp/objective.txt"],
+            vec!["objective", "start", "--stdin"],
+            vec!["objective", "list", "--status", "ready"],
+            vec!["objective", "get", OBJECTIVE_ID],
+            vec!["objective", "plan", OBJECTIVE_ID],
+            vec!["objective", "validate", OBJECTIVE_ID, "--dry-run"],
+            vec![
+                "objective",
+                "supervise",
+                OBJECTIVE_ID,
+                "--worker-model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-worker-attempts",
+                "2",
+                "--max-cycles",
+                "3",
+            ],
+            vec!["objective", "cancel", OBJECTIVE_ID],
             vec![
                 "resume",
                 TASK_ID,
@@ -1906,6 +2363,58 @@ mod tests {
             vec!["harness", "ticket", "resolve", TICKET_ID, "--model", "gpt"],
             vec![
                 "harness",
+                "objective",
+                "start",
+                "--prompt",
+                "Build the thing",
+                "--supervise",
+                "--planner-model",
+                "gpt",
+                "--worker-model",
+                "coder",
+                "--ticket-model",
+                "gpt-ticket",
+                "--max-worker-attempts",
+                "4",
+                "--max-cycles",
+                "5",
+            ],
+            vec!["harness", "objective", "start", "Build", "the", "thing"],
+            vec![
+                "harness",
+                "objective",
+                "start",
+                "--prompt-file",
+                "/tmp/objective.txt",
+            ],
+            vec!["harness", "objective", "start", "--stdin"],
+            vec!["harness", "objective", "list", "--status", "running"],
+            vec!["harness", "objective", "get", OBJECTIVE_ID],
+            vec!["harness", "objective", "plan", OBJECTIVE_ID],
+            vec![
+                "harness",
+                "objective",
+                "validate",
+                OBJECTIVE_ID,
+                "--dry-run",
+            ],
+            vec![
+                "harness",
+                "objective",
+                "supervise",
+                OBJECTIVE_ID,
+                "--worker-model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-worker-attempts",
+                "2",
+                "--max-cycles",
+                "3",
+            ],
+            vec!["harness", "objective", "cancel", OBJECTIVE_ID],
+            vec![
+                "harness",
                 "resume",
                 TASK_ID,
                 "--ticket",
@@ -1984,6 +2493,7 @@ mod tests {
         for command in [
             vec!["task", "list", "--status", "wat"],
             vec!["ticket", "list", "--status", "wat"],
+            vec!["objective", "list", "--status", "wat"],
             vec!["completions", "powershell"],
         ] {
             let err = parse_command(command.into_iter().map(str::to_string).collect()).unwrap_err();
@@ -1993,6 +2503,7 @@ mod tests {
         for command in [
             vec!["harness", "task", "list", "--status", "wat"],
             vec!["harness", "ticket", "list", "--status", "wat"],
+            vec!["harness", "objective", "list", "--status", "wat"],
             vec!["harness", "completions", "powershell"],
         ] {
             assert!(
@@ -2058,6 +2569,51 @@ mod tests {
                 "cargo test",
                 "--ticket",
                 TICKET_ID,
+            ],
+        ] {
+            assert!(
+                build_clap().try_get_matches_from(command.clone()).is_err(),
+                "clap unexpectedly accepted {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clap_rejects_invalid_objective_start_prompt_parity_cases() {
+        for command in [
+            vec!["harness", "objective", "start"],
+            vec![
+                "harness",
+                "objective",
+                "start",
+                "Build",
+                "--prompt",
+                "Other",
+            ],
+            vec![
+                "harness",
+                "objective",
+                "start",
+                "--prompt",
+                "Build",
+                "--prompt-file",
+                "/tmp/objective.txt",
+            ],
+            vec![
+                "harness",
+                "objective",
+                "start",
+                "--prompt",
+                "Build",
+                "--stdin",
+            ],
+            vec![
+                "harness",
+                "objective",
+                "start",
+                "--prompt-file",
+                "/tmp/objective.txt",
+                "--stdin",
             ],
         ] {
             assert!(
@@ -2149,6 +2705,194 @@ mod tests {
     }
 
     #[test]
+    fn objective_command_parser_accepts_shapes_and_prompt_inputs() {
+        let parsed = parse_command(
+            [
+                "objective",
+                "start",
+                "Build",
+                "an",
+                "objective",
+                "--with-literal-looking-text",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::ObjectiveStart {
+                prompt: ObjectivePromptInput::Text(
+                    "Build an objective --with-literal-looking-text".to_string()
+                ),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            }
+        );
+
+        let parsed = parse_command(
+            [
+                "objective",
+                "start",
+                "--prompt",
+                "Build an objective",
+                "--supervise",
+                "--planner-model",
+                "planner",
+                "--worker-model",
+                "worker",
+                "--ticket-model",
+                "ticket",
+                "--max-worker-attempts",
+                "8",
+                "--max-cycles",
+                "9",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::ObjectiveStart {
+                prompt: ObjectivePromptInput::Text("Build an objective".to_string()),
+                supervise: true,
+                planner_model: Some("planner".to_string()),
+                worker_model: Some("worker".to_string()),
+                ticket_model: Some("ticket".to_string()),
+                max_worker_attempts: Some(8),
+                max_cycles: Some(9),
+            }
+        );
+
+        let parsed = parse_command(
+            [
+                "objective",
+                "start",
+                "--prompt=Build an objective",
+                "--planner-model=planner",
+                "--worker-model=worker",
+                "--ticket-model=ticket",
+                "--max-worker-attempts=8",
+                "--max-cycles=9",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::ObjectiveStart {
+                prompt: ObjectivePromptInput::Text("Build an objective".to_string()),
+                supervise: false,
+                planner_model: Some("planner".to_string()),
+                worker_model: Some("worker".to_string()),
+                ticket_model: Some("ticket".to_string()),
+                max_worker_attempts: Some(8),
+                max_cycles: Some(9),
+            }
+        );
+
+        let parsed = parse_command(
+            [
+                "objective",
+                "supervise",
+                OBJECTIVE_ID,
+                "--worker-model=coder",
+                "--ticket-model=gpt",
+                "--max-worker-attempts=2",
+                "--max-cycles=3",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            ParsedCommand::ObjectiveSupervise {
+                objective_id: ObjectiveId::parse(OBJECTIVE_ID).unwrap(),
+                worker_model: Some("coder".to_string()),
+                ticket_model: Some("gpt".to_string()),
+                max_worker_attempts: Some(2),
+                max_cycles: Some(3),
+            }
+        );
+
+        for command in [
+            vec!["objective", "start", "--prompt-file", "/tmp/objective.txt"],
+            vec!["objective", "start", "--stdin"],
+            vec!["objective", "list", "--status", "planning"],
+            vec!["objective", "list", "--status=ready"],
+            vec!["objective", "get", OBJECTIVE_ID],
+            vec!["objective", "plan", OBJECTIVE_ID],
+            vec!["objective", "validate", OBJECTIVE_ID, "--dry-run"],
+            vec![
+                "objective",
+                "supervise",
+                OBJECTIVE_ID,
+                "--worker-model",
+                "coder",
+                "--ticket-model",
+                "gpt",
+                "--max-worker-attempts",
+                "2",
+                "--max-cycles",
+                "3",
+            ],
+            vec!["objective", "cancel", OBJECTIVE_ID],
+        ] {
+            assert!(
+                parse_command(command.into_iter().map(str::to_string).collect()).is_ok(),
+                "parser rejected objective command"
+            );
+        }
+    }
+
+    #[test]
+    fn objective_parser_rejects_invalid_status_and_prompt_conflicts() {
+        let err = parse_command(
+            ["objective", "list", "--status", "done"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .unwrap_err();
+        assert_eq!(err.into_exit().code(), 2);
+
+        for command in [
+            vec!["objective", "start"],
+            vec!["objective", "start", "Build", "--prompt", "Other"],
+            vec![
+                "objective",
+                "start",
+                "--prompt",
+                "Build",
+                "--prompt-file",
+                "/tmp/objective.txt",
+            ],
+            vec!["objective", "start", "--prompt", "Build", "--stdin"],
+            vec![
+                "objective",
+                "start",
+                "--prompt-file",
+                "/tmp/objective.txt",
+                "--stdin",
+            ],
+        ] {
+            let err = parse_command(command.into_iter().map(str::to_string).collect()).unwrap_err();
+            assert_eq!(err.into_exit().code(), 2);
+        }
+    }
+
+    #[test]
     fn parser_rejects_invalid_supervise_forms() {
         for (command, expected) in [
             (vec!["supervise"], "missing task-id or --create"),
@@ -2212,6 +2956,8 @@ mod tests {
         let help = catalog.help(VERSION);
 
         assert!(help.contains("supervise <task-id> [--ticket <ticket-id>]"));
+        assert!(help.contains("objective start [<prompt>...]"));
+        assert!(help.contains("objective list [--status <status>]"));
         assert!(
             help.contains("supervise --create --title <title> --goal <goal> --validation <cmd>..."),
             "{help}"
@@ -2242,6 +2988,33 @@ mod tests {
                         })
                     )
                 })
+        }));
+
+        let objective_list = find_schema_command(&["objective", "list"]).unwrap();
+        assert!(objective_list.options.iter().any(|option| {
+            option.long == "status"
+                && option.value.as_ref().is_some_and(|value| {
+                    value.kind == ValueKind::ObjectiveStatus
+                        && value.source
+                            == ValueSource::Static(&[
+                                "planning",
+                                "ready",
+                                "running",
+                                "blocked",
+                                "complete",
+                                "failed",
+                                "cancelled",
+                            ])
+                })
+        }));
+        let objective_get = find_schema_command(&["objective", "get"]).unwrap();
+        assert!(objective_get.positionals.iter().any(|arg| {
+            arg.name == "objective-id"
+                && arg.value.kind == ValueKind::ObjectiveId
+                && matches!(
+                    arg.value.source,
+                    ValueSource::StateQuery(StateQueryKind::ObjectiveId { .. })
+                )
         }));
     }
 
@@ -2440,6 +3213,207 @@ mod tests {
         let final_object: Value = serde_json::from_str(stdout_lines[0]).unwrap();
         assert_eq!(final_object["status"], "complete");
         assert_eq!(final_object["data"]["task_id"], TASK_ID);
+    }
+
+    #[test]
+    fn json_sink_writes_objective_progress_as_ndjson_to_stderr() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let progress = ObjectiveProgressEvent::new(
+            ObjectiveProgressKind::ValidationStarted,
+            crate::domain::ObjectiveId::parse("objective_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            ObjectiveProgressPhase::Validating,
+            crate::domain::ObjectiveStatus::Running,
+            "validating objective",
+            "2026-05-14T12:00:00Z",
+        );
+
+        sink.event(&CommandEvent::objective_progress(
+            progress,
+            CommandEventLevel::Info,
+        ))
+        .unwrap();
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        let lines = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{stderr:?}");
+        let event: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event["event"], "objective.validation_started");
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["level"], "info");
+        assert_eq!(
+            event["objective_id"],
+            "objective_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(event["phase"], "validating");
+        assert_eq!(event["status"], "running");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn objective_runtime_start_streams_events_and_final_json() {
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+
+        let exit = runtime.dispatch(
+            [
+                "--repo=/repo",
+                "objective",
+                "start",
+                "--prompt",
+                "Build an objective",
+                "--supervise",
+                "--planner-model",
+                "planner",
+                "--worker-model",
+                "worker",
+                "--ticket-model",
+                "ticket",
+                "--max-worker-attempts",
+                "8",
+                "--max-cycles",
+                "9",
+                "--output",
+                "json",
+            ],
+            &mut sink,
+        );
+
+        assert_eq!(exit.code(), 0);
+        let calls = service.objective_start_requests.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].prompt,
+            ObjectivePromptInput::Text("Build an objective".to_string())
+        );
+        assert!(calls[0].supervise);
+        assert_eq!(calls[0].runtime.repo, Some(PathBuf::from("/repo")));
+        assert_eq!(calls[0].planner_model.as_deref(), Some("planner"));
+        assert_eq!(calls[0].worker_model.as_deref(), Some("worker"));
+        assert_eq!(calls[0].ticket_model.as_deref(), Some("ticket"));
+        assert_eq!(calls[0].max_worker_attempts, Some(8));
+        assert_eq!(calls[0].max_cycles, Some(9));
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        let events = stderr.lines().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{stderr:?}");
+        let event: Value = serde_json::from_str(events[0]).unwrap();
+        assert_eq!(event["event"], "objective.planning_started");
+        assert_eq!(event["objective_id"], OBJECTIVE_ID);
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{stdout:?}");
+        let final_json: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(final_json["status"], "complete");
+        assert_eq!(final_json["data"]["objective_id"], OBJECTIVE_ID);
+    }
+
+    #[test]
+    fn objective_runtime_list_get_plan_validate_supervise_and_cancel_dispatch() {
+        let service = FakeService::default();
+        let runtime = CommandRuntime::new(&service);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            ["objective", "list", "--status", "ready", "--output", "json"],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        let value: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["data"]["objectives"].as_array().unwrap().len(), 1);
+        assert_eq!(value["data"]["objectives"][0]["status"], "ready");
+
+        stdout.clear();
+        stderr.clear();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            ["objective", "get", OBJECTIVE_ID, "--output", "json"],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        let value: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["data"]["objective_id"], OBJECTIVE_ID);
+
+        stdout.clear();
+        stderr.clear();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            ["objective", "plan", OBJECTIVE_ID, "--output", "json"],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        let value: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["data"]["objective_id"], OBJECTIVE_ID);
+
+        stdout.clear();
+        stderr.clear();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            [
+                "objective",
+                "validate",
+                OBJECTIVE_ID,
+                "--dry-run",
+                "--output",
+                "json",
+            ],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        let validation_calls = service.objective_validate_requests.borrow();
+        assert_eq!(validation_calls.len(), 1);
+        assert_eq!(validation_calls[0].0.as_str(), OBJECTIVE_ID);
+        assert!(validation_calls[0].1.dry_run);
+
+        stdout.clear();
+        stderr.clear();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            [
+                "objective",
+                "supervise",
+                OBJECTIVE_ID,
+                "--worker-model",
+                "worker",
+                "--ticket-model",
+                "ticket",
+                "--max-worker-attempts",
+                "7",
+                "--max-cycles",
+                "11",
+                "--output",
+                "json",
+            ],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        let supervise_calls = service.objective_supervise_requests.borrow();
+        assert_eq!(supervise_calls.len(), 1);
+        assert_eq!(supervise_calls[0].0.as_str(), OBJECTIVE_ID);
+        assert_eq!(supervise_calls[0].1.worker_model.as_deref(), Some("worker"));
+        assert_eq!(supervise_calls[0].1.ticket_model.as_deref(), Some("ticket"));
+        assert_eq!(supervise_calls[0].1.max_worker_attempts, Some(7));
+        assert_eq!(supervise_calls[0].1.max_cycles, Some(11));
+
+        stdout.clear();
+        stderr.clear();
+        let mut sink = JsonSink::new(&mut stdout, &mut stderr, false);
+        let exit = runtime.dispatch(
+            ["objective", "cancel", OBJECTIVE_ID, "--output", "json"],
+            &mut sink,
+        );
+        assert_eq!(exit.code(), 0);
+        assert_eq!(
+            service.objective_cancel_requests.borrow()[0].as_str(),
+            OBJECTIVE_ID
+        );
     }
 
     #[test]
@@ -2803,6 +3777,10 @@ mod tests {
         resume_requests: RefCell<Vec<(TaskId, ResumeTaskOptions)>>,
         supervise_requests: RefCell<Vec<(TaskId, SuperviseTaskOptions)>>,
         supervise_create_requests: RefCell<Vec<SuperviseCreateOptions>>,
+        objective_start_requests: RefCell<Vec<ObjectiveStartOptions>>,
+        objective_supervise_requests: RefCell<Vec<(ObjectiveId, ObjectiveSuperviseOptions)>>,
+        objective_validate_requests: RefCell<Vec<(ObjectiveId, ObjectiveValidateOptions)>>,
+        objective_cancel_requests: RefCell<Vec<ObjectiveId>>,
     }
 
     impl HarnessService for FakeService {
@@ -2839,6 +3817,33 @@ mod tests {
 
         fn list_tasks(&self) -> HarnessResult<Vec<Task>> {
             Ok(Vec::new())
+        }
+
+        fn list_objectives(
+            &self,
+            status: Option<ObjectiveStatus>,
+        ) -> HarnessResult<Vec<crate::state::Objective>> {
+            let mut objectives = vec![
+                fake_objective(OBJECTIVE_ID, ObjectiveStatus::Ready),
+                fake_objective(
+                    "objective_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                    ObjectiveStatus::Complete,
+                ),
+            ];
+            if let Some(status) = status {
+                objectives.retain(|objective| objective.status == status);
+            }
+            Ok(objectives)
+        }
+
+        fn get_objective(
+            &self,
+            objective_id: &ObjectiveId,
+        ) -> HarnessResult<crate::state::Objective> {
+            Ok(fake_objective(
+                objective_id.as_str(),
+                ObjectiveStatus::Ready,
+            ))
         }
 
         fn get_task(&self, _task_id: &TaskId) -> HarnessResult<Task> {
@@ -2947,6 +3952,124 @@ mod tests {
                 CommandExit::success(),
                 json!({ "task_id": TASK_ID }),
             ))
+        }
+
+        fn start_objective(&self, options: ObjectiveStartOptions) -> HarnessResult<CommandResult> {
+            self.objective_start_requests.borrow_mut().push(options);
+            let objective_id = ObjectiveId::parse(OBJECTIVE_ID).unwrap();
+            let progress = ObjectiveProgressEvent::new(
+                ObjectiveProgressKind::PlanningStarted,
+                objective_id.clone(),
+                ObjectiveProgressPhase::Planning,
+                ObjectiveStatus::Planning,
+                "planning objective",
+                "2026-05-14T12:00:00Z",
+            );
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({
+                    "objective_id": objective_id.as_str(),
+                    "status": "ready",
+                    "next": format!("harness objective supervise {}", objective_id.as_str()),
+                }),
+            )
+            .with_event(CommandEvent::objective_progress(
+                progress,
+                CommandEventLevel::Info,
+            )))
+        }
+
+        fn get_objective_plan(&self, objective_id: &ObjectiveId) -> HarnessResult<CommandResult> {
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({
+                    "objective_id": objective_id.as_str(),
+                    "plan": {
+                        "summary": "Plan summary",
+                        "tasks": [],
+                    },
+                }),
+            ))
+        }
+
+        fn validate_objective(
+            &self,
+            objective_id: &ObjectiveId,
+            options: ObjectiveValidateOptions,
+        ) -> HarnessResult<CommandResult> {
+            self.objective_validate_requests
+                .borrow_mut()
+                .push((objective_id.clone(), options));
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({
+                    "objective_id": objective_id.as_str(),
+                    "validation": {
+                        "status": "passed",
+                        "dry_run": self.objective_validate_requests.borrow().last().unwrap().1.dry_run,
+                    },
+                }),
+            ))
+        }
+
+        fn supervise_objective(
+            &self,
+            objective_id: &ObjectiveId,
+            options: ObjectiveSuperviseOptions,
+        ) -> HarnessResult<CommandResult> {
+            self.objective_supervise_requests
+                .borrow_mut()
+                .push((objective_id.clone(), options));
+            let progress = ObjectiveProgressEvent::new(
+                ObjectiveProgressKind::SupervisionStarted,
+                objective_id.clone(),
+                ObjectiveProgressPhase::Running,
+                ObjectiveStatus::Running,
+                "supervising objective",
+                "2026-05-14T12:00:01Z",
+            );
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({
+                    "objective_id": objective_id.as_str(),
+                    "status": "complete",
+                }),
+            )
+            .with_event(CommandEvent::objective_progress(
+                progress,
+                CommandEventLevel::Info,
+            )))
+        }
+
+        fn cancel_objective(&self, objective_id: &ObjectiveId) -> HarnessResult<CommandResult> {
+            self.objective_cancel_requests
+                .borrow_mut()
+                .push(objective_id.clone());
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                json!({
+                    "objective_id": objective_id.as_str(),
+                    "status": "cancelled",
+                }),
+            ))
+        }
+    }
+
+    fn fake_objective(id: &str, status: ObjectiveStatus) -> crate::state::Objective {
+        crate::state::Objective {
+            id: ObjectiveId::parse(id).unwrap(),
+            title: "Objective".to_string(),
+            prompt: "Build something".to_string(),
+            summary: "Objective summary".to_string(),
+            status,
+            planner_model: Some("planner".to_string()),
+            worker_model: Some("worker".to_string()),
+            ticket_model: Some("ticket".to_string()),
+            active_plan_id: None,
+            monitor_lease_owner: None,
+            monitor_lease_expires_at: None,
+            created_at: "2026-05-14T12:00:00Z".to_string(),
+            updated_at: "2026-05-14T12:00:00Z".to_string(),
         }
     }
 }

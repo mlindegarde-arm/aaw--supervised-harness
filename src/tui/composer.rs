@@ -6,6 +6,25 @@ use crate::error::HarnessResult;
 use std::cmp;
 
 const DEFAULT_MAX_SUGGESTIONS: usize = 8;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    PlainPrompt,
+    SlashCommand,
+    ShellEscape,
+}
+
+impl InputMode {
+    pub fn detect(text: &str) -> Self {
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('!') {
+            Self::ShellEscape
+        } else if trimmed.starts_with('/') {
+            Self::SlashCommand
+        } else {
+            Self::PlainPrompt
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxClass {
@@ -87,6 +106,29 @@ impl ComposerState {
         &self.buffer
     }
 
+    pub fn input_mode(&self) -> InputMode {
+        InputMode::detect(&self.buffer)
+    }
+
+    pub fn slash_command_text(&self) -> Option<String> {
+        (self.input_mode() == InputMode::SlashCommand).then(|| {
+            self.buffer
+                .trim_start()
+                .strip_prefix('/')
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+
+    pub fn compatibility_warning(&self) -> Option<String> {
+        let trimmed = self.buffer.trim_start();
+        if trimmed.starts_with(['/', '!']) {
+            return None;
+        }
+        legacy_command_root(trimmed)
+            .map(|root| format!("Use /{root} to run harness commands in prompt-first mode."))
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -98,9 +140,16 @@ impl ComposerState {
     }
 
     pub fn set_completion_set(&mut self, completion_set: CompletionSet) {
+        let completion_set = self.map_completion_for_mode(completion_set);
         self.selected_suggestion = None;
         self.suggestions_visible = !completion_set.candidates.is_empty();
         self.completion_set = Some(completion_set);
+    }
+
+    pub fn take_completion_set(&mut self) -> Option<CompletionSet> {
+        self.selected_suggestion = None;
+        self.suggestions_visible = false;
+        self.completion_set.take()
     }
 
     pub fn refresh_completion<E: CompleterEngine>(
@@ -108,7 +157,20 @@ impl ComposerState {
         engine: &E,
         context: &CompletionContext<'_>,
     ) -> HarnessResult<()> {
-        let completion_set = engine.complete(&self.buffer, self.cursor, context)?;
+        if self.input_mode() == InputMode::PlainPrompt {
+            self.reset_completion_state();
+            return Ok(());
+        }
+        let prefix = slash_prefix_len(&self.buffer);
+        let (line, cursor) = if self.input_mode() == InputMode::SlashCommand {
+            (
+                self.buffer[prefix..].to_string(),
+                self.cursor.saturating_sub(prefix),
+            )
+        } else {
+            (self.buffer.clone(), self.cursor)
+        };
+        let completion_set = engine.complete(&line, cursor, context)?;
         self.set_completion_set(completion_set);
         Ok(())
     }
@@ -130,7 +192,7 @@ impl ComposerState {
     }
 
     pub fn shell_escape_hint(&self) -> Option<String> {
-        if !self.buffer.trim_start().starts_with('!') {
+        if self.input_mode() != InputMode::ShellEscape {
             return None;
         }
         self.completion_set
@@ -147,6 +209,9 @@ impl ComposerState {
     }
 
     pub fn hint_text(&self) -> Option<String> {
+        if let Some(warning) = self.compatibility_warning() {
+            return Some(warning);
+        }
         self.shell_escape_hint()
             .or_else(|| {
                 self.completion_set
@@ -300,6 +365,10 @@ impl ComposerState {
     }
 
     pub fn tab_complete(&mut self) -> ComposerOutcome {
+        if self.input_mode() == InputMode::PlainPrompt {
+            self.suggestions_visible = false;
+            return ComposerOutcome::Noop;
+        }
         if self.apply_selected_if_visible() {
             return ComposerOutcome::AppliedSuggestion;
         }
@@ -337,6 +406,36 @@ impl ComposerState {
             return ComposerOutcome::Noop;
         }
         if command.starts_with('!') {
+            self.push_history(command.clone());
+            self.buffer.clear();
+            self.cursor = 0;
+            self.reset_transient_state();
+            return ComposerOutcome::Submitted(command);
+        }
+        if let Some(command) = command.strip_prefix('/') {
+            let command = command.trim_start().to_string();
+            if command.is_empty() {
+                return ComposerOutcome::Noop;
+            }
+            match self.readiness().cloned().unwrap_or(CommandReadiness::Ready) {
+                CommandReadiness::Ready => {}
+                CommandReadiness::Incomplete { hint, .. } => {
+                    return ComposerOutcome::Blocked { hint };
+                }
+                CommandReadiness::Invalid { diagnostic } => {
+                    return ComposerOutcome::Blocked { hint: diagnostic };
+                }
+            }
+            self.push_history(format!("/{command}"));
+            self.buffer.clear();
+            self.cursor = 0;
+            self.reset_transient_state();
+            return ComposerOutcome::Submitted(command);
+        }
+        if let Some(hint) = self.compatibility_warning() {
+            return ComposerOutcome::Blocked { hint };
+        }
+        if self.input_mode() == InputMode::PlainPrompt {
             self.push_history(command.clone());
             self.buffer.clear();
             self.cursor = 0;
@@ -464,6 +563,26 @@ impl ComposerState {
         self.replace_span(start, end, &candidate.replacement);
     }
 
+    fn map_completion_for_mode(&self, mut completion_set: CompletionSet) -> CompletionSet {
+        match self.input_mode() {
+            InputMode::PlainPrompt => {
+                completion_set.candidates.clear();
+                completion_set.replacement_start = self.cursor;
+                completion_set.replacement_end = self.cursor;
+                completion_set
+            }
+            InputMode::SlashCommand => {
+                let prefix = slash_prefix_len(&self.buffer);
+                completion_set.replacement_start =
+                    completion_set.replacement_start.saturating_add(prefix);
+                completion_set.replacement_end =
+                    completion_set.replacement_end.saturating_add(prefix);
+                completion_set
+            }
+            InputMode::ShellEscape => completion_set,
+        }
+    }
+
     fn replace_span(&mut self, start: usize, end: usize, replacement: &str) {
         let start = clamp_to_boundary(&self.buffer, start);
         let end = clamp_to_boundary(&self.buffer, end);
@@ -561,6 +680,43 @@ fn format_candidate_hint(candidate: &CompletionCandidate) -> String {
     }
 }
 
+fn slash_prefix_len(text: &str) -> usize {
+    let leading = text.len() - text.trim_start().len();
+    if text[leading..].starts_with('/') {
+        leading + 1
+    } else {
+        0
+    }
+}
+
+fn legacy_command_root(text: &str) -> Option<&str> {
+    let mut tokens = text.split_whitespace();
+    let root = tokens.next()?;
+    let second = tokens.next();
+    let is_legacy = match root {
+        "task" => matches!(second, Some("create" | "list" | "get" | "run" | "cleanup")),
+        "ticket" => matches!(second, Some("list" | "get" | "resolve")),
+        "objective" => matches!(
+            second,
+            Some("start" | "list" | "get" | "plan" | "validate" | "supervise" | "cancel")
+        ),
+        "config" => matches!(second, Some("get" | "set")),
+        "workspace" => matches!(second, Some("prune")),
+        "resume" | "supervise" => {
+            second.is_some_and(|token| token.starts_with("task_") || token.starts_with("--"))
+        }
+        "run" => {
+            text.contains("--title") || text.contains("--goal") || text.contains("--validation")
+        }
+        "init" | "doctor" | "completions" | "version" => {
+            second.is_none() || second.is_some_and(|token| token.starts_with("--"))
+        }
+        "help" => second.is_none(),
+        _ => false,
+    };
+    is_legacy.then_some(root)
+}
+
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
     text[..cursor].char_indices().last().map(|(idx, _)| idx)
 }
@@ -646,8 +802,9 @@ fn previous_nonspace_is_value_context(text: &str, start: usize) -> bool {
 mod tests {
     use super::*;
     use crate::completion::{
-        CompletionContext, CompletionEngine, CompletionStateView, TaskCompletionItem,
-        TaskCompletionScope, TicketCompletionItem, TicketCompletionScope,
+        CompletionContext, CompletionEngine, CompletionStateView, ObjectiveCompletionItem,
+        ObjectiveCompletionScope, TaskCompletionItem, TaskCompletionScope, TicketCompletionItem,
+        TicketCompletionScope,
     };
     use crate::domain::{RunId, TaskId, TaskStatus, TicketId, TicketStatus};
     use crate::runtime::build_cli;
@@ -690,6 +847,13 @@ mod tests {
                 status: TicketStatus::Open,
                 summary: "Need decision".to_string(),
             }])
+        }
+
+        fn objectives_for_completion(
+            &self,
+            _scope: ObjectiveCompletionScope,
+        ) -> HarnessResult<Vec<ObjectiveCompletionItem>> {
+            Ok(Vec::new())
         }
     }
 
@@ -745,9 +909,9 @@ mod tests {
     #[test]
     fn composer_suggestion_insertion_uses_replacement_span() {
         let mut composer = ComposerState::new();
-        composer.set_text("task get task_zzz");
+        composer.set_text("/task get task_zzz");
         composer.move_to_start();
-        for _ in 0.."task get task".len() {
+        for _ in 0.."/task get task".len() {
             composer.move_right();
         }
         refresh(&mut composer);
@@ -760,13 +924,13 @@ mod tests {
         );
         composer.select_next_or_history_next();
         assert_eq!(composer.tab_complete(), ComposerOutcome::AppliedSuggestion);
-        assert_eq!(composer.text(), format!("task get {TASK_READY}"));
+        assert_eq!(composer.text(), format!("/task get {TASK_READY}"));
     }
 
     #[test]
     fn composer_scoped_id_completion_keeps_display_context_out_of_inserted_text() {
         let mut composer = ComposerState::new();
-        composer.set_text(format!("resume {TASK_STUCK} --ticket ticket_"));
+        composer.set_text(format!("/resume {TASK_STUCK} --ticket ticket_"));
         refresh(&mut composer);
 
         let rows = composer.suggestion_rows();
@@ -777,14 +941,94 @@ mod tests {
         assert_eq!(composer.tab_complete(), ComposerOutcome::AppliedSuggestion);
         assert_eq!(
             composer.text(),
-            format!("resume {TASK_STUCK} --ticket {TICKET_OPEN}")
+            format!("/resume {TASK_STUCK} --ticket {TICKET_OPEN}")
+        );
+    }
+
+    #[test]
+    fn prompt_first_input_modes_and_compatibility_warning() {
+        let mut composer = ComposerState::new();
+        composer.set_text("Create a CLI");
+        assert_eq!(composer.input_mode(), InputMode::PlainPrompt);
+        assert!(composer.compatibility_warning().is_none());
+
+        composer.set_text("task list");
+        assert_eq!(composer.input_mode(), InputMode::PlainPrompt);
+        assert_eq!(
+            composer.compatibility_warning().as_deref(),
+            Some("Use /task to run harness commands in prompt-first mode.")
+        );
+
+        composer.set_text("help me build a CLI");
+        assert_eq!(composer.input_mode(), InputMode::PlainPrompt);
+        assert!(composer.compatibility_warning().is_none());
+
+        composer.set_text("run the tests and fix failures");
+        assert_eq!(composer.input_mode(), InputMode::PlainPrompt);
+        assert!(composer.compatibility_warning().is_none());
+
+        composer.set_text("/task list");
+        assert_eq!(composer.input_mode(), InputMode::SlashCommand);
+        assert_eq!(composer.slash_command_text().as_deref(), Some("task list"));
+
+        composer.set_text("!git status --short");
+        assert_eq!(composer.input_mode(), InputMode::ShellEscape);
+    }
+
+    #[test]
+    fn plain_prompt_does_not_command_complete_but_slash_command_does() {
+        let mut composer = ComposerState::new();
+        composer.set_text("ta");
+        refresh(&mut composer);
+        assert!(composer.suggestion_rows().is_empty());
+        assert!(composer.hint_text().is_none());
+        assert_eq!(composer.tab_complete(), ComposerOutcome::Noop);
+        assert_eq!(composer.text(), "ta");
+
+        composer.set_text("/ta");
+        refresh(&mut composer);
+        assert!(
+            composer
+                .suggestion_rows()
+                .iter()
+                .any(|row| row.replacement == "task")
+        );
+        assert_eq!(composer.tab_complete(), ComposerOutcome::AppliedSuggestion);
+        assert_eq!(composer.text(), "/task");
+    }
+
+    #[test]
+    fn slash_enter_submits_command_without_slash() {
+        let mut composer = ComposerState::new();
+        composer.set_text("/task list");
+
+        assert_eq!(
+            composer.enter(),
+            ComposerOutcome::Submitted("task list".to_string())
+        );
+        assert_eq!(composer.text(), "");
+    }
+
+    #[test]
+    fn prompt_first_natural_language_can_start_with_command_words() {
+        let mut composer = ComposerState::new();
+        composer.set_text("help me build a CLI");
+        assert_eq!(
+            composer.enter(),
+            ComposerOutcome::Submitted("help me build a CLI".to_string())
+        );
+
+        composer.set_text("run the tests and fix failures");
+        assert_eq!(
+            composer.enter(),
+            ComposerOutcome::Submitted("run the tests and fix failures".to_string())
         );
     }
 
     #[test]
     fn composer_tab_uses_longest_common_prefix_before_menu_selection() {
         let mut composer = ComposerState::new();
-        composer.set_text("t");
+        composer.set_text("/t");
         composer.set_completion_set(CompletionSet {
             replacement_start: 0,
             replacement_end: 1,
@@ -812,34 +1056,34 @@ mod tests {
         });
 
         assert_eq!(composer.tab_complete(), ComposerOutcome::AppliedSuggestion);
-        assert_eq!(composer.text(), "ti");
+        assert_eq!(composer.text(), "/ti");
 
-        composer.set_text("tas");
+        composer.set_text("/tas");
         refresh(&mut composer);
         assert_eq!(composer.tab_complete(), ComposerOutcome::AppliedSuggestion);
-        assert_eq!(composer.text(), "task");
+        assert_eq!(composer.text(), "/task");
     }
 
     #[test]
     fn composer_enter_applies_visible_selected_suggestion_before_submit() {
         let mut composer = ComposerState::new();
-        composer.set_text("task r");
+        composer.set_text("/task r");
         refresh(&mut composer);
 
         assert!(composer.suggestions_visible());
         composer.select_next_or_history_next();
         assert_eq!(composer.enter(), ComposerOutcome::AppliedSuggestion);
-        assert_eq!(composer.text(), "task run");
+        assert_eq!(composer.text(), "/task run");
     }
 
     #[test]
     fn composer_enter_submits_ready_commands_and_blocks_incomplete_commands() {
         let mut composer = ComposerState::new();
-        composer.set_text("task get");
+        composer.set_text("/task get");
         refresh(&mut composer);
         assert!(matches!(composer.enter(), ComposerOutcome::Blocked { .. }));
 
-        composer.set_text(format!("task get {TASK_READY}"));
+        composer.set_text(format!("/task get {TASK_READY}"));
         refresh(&mut composer);
         assert_eq!(
             composer.enter(),
@@ -886,7 +1130,7 @@ mod tests {
     #[test]
     fn composer_up_down_select_suggestions_before_history() {
         let mut composer = ComposerState::new();
-        composer.set_text("task ");
+        composer.set_text("/task ");
         refresh(&mut composer);
 
         let first = composer.selected_suggestion();
@@ -902,7 +1146,7 @@ mod tests {
     #[test]
     fn composer_syntax_tokens_cover_command_option_value_and_error() {
         let mut composer = ComposerState::new();
-        composer.set_text("task list --status ready");
+        composer.set_text("/task list --status ready");
         refresh(&mut composer);
         let classes = composer
             .syntax_tokens()
@@ -913,7 +1157,7 @@ mod tests {
         assert!(classes.contains(&SyntaxClass::Option));
         assert!(classes.contains(&SyntaxClass::Value));
 
-        composer.set_text("not-a-command ");
+        composer.set_text("/not-a-command ");
         refresh(&mut composer);
         assert_eq!(composer.syntax_tokens()[0].class, SyntaxClass::Error);
     }
@@ -921,7 +1165,7 @@ mod tests {
     #[test]
     fn composer_ctrl_c_d_and_escape_behaviors() {
         let mut composer = ComposerState::new();
-        composer.set_text("task ");
+        composer.set_text("/task ");
         refresh(&mut composer);
         assert_eq!(composer.escape(), ComposerOutcome::Edited);
         assert!(!composer.suggestions_visible());

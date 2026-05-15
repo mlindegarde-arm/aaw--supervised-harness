@@ -1,16 +1,17 @@
 pub mod supervisor;
 
-use crate::domain::{HarnessConfig, Task, TaskId, Ticket, TicketId};
+use crate::domain::{HarnessConfig, ObjectiveId, ObjectiveStatus, Task, TaskId, Ticket, TicketId};
 use crate::orchestrator::RunOrchestrator;
 use crate::providers::{
     ModelProvider, ModelRequest, ModelResponse, OllamaProvider, OpenAiCompatibleProvider,
     ProviderError, ProviderErrorKind, ProviderFuture,
 };
 use crate::runtime::{
-    CommandResult, OutputSink, ResumeTaskOptions, SuperviseCreateOptions, SuperviseTaskOptions,
-    TaskRunOptions, TicketResolveOptions,
+    CommandExit, CommandResult, ObjectiveStartOptions, ObjectiveSuperviseOptions,
+    ObjectiveValidateOptions, OutputSink, ResumeTaskOptions, SuperviseCreateOptions,
+    SuperviseTaskOptions, TaskRunOptions, TicketResolveOptions,
 };
-use crate::state::{SqliteTaskStore, TaskStore};
+use crate::state::{Objective, SqliteTaskStore, TaskStore};
 use crate::workspace::{CommandRunner, GitWorkspaceManager, WorkspaceManager};
 use crate::{HarnessError, HarnessResult};
 use std::path::PathBuf;
@@ -30,6 +31,18 @@ pub trait HarnessService {
     ) -> HarnessResult<Task>;
 
     fn list_tasks(&self) -> HarnessResult<Vec<Task>>;
+    fn list_objectives(&self, status: Option<ObjectiveStatus>) -> HarnessResult<Vec<Objective>> {
+        let _ = status;
+        Err(HarnessError::External(
+            "list_objectives is not wired until objective service integration".to_string(),
+        ))
+    }
+    fn get_objective(&self, objective_id: &crate::domain::ObjectiveId) -> HarnessResult<Objective> {
+        let _ = objective_id;
+        Err(HarnessError::External(
+            "get_objective is not wired until objective service integration".to_string(),
+        ))
+    }
     fn get_task(&self, task_id: &TaskId) -> HarnessResult<Task>;
     fn run_task(&self, task_id: &TaskId, options: TaskRunOptions) -> HarnessResult<CommandResult>;
     fn list_tickets(&self) -> HarnessResult<Vec<Ticket>>;
@@ -83,6 +96,75 @@ pub trait HarnessService {
             sink.event(event)?;
         }
         Ok(result)
+    }
+
+    fn start_objective(&self, _options: ObjectiveStartOptions) -> HarnessResult<CommandResult> {
+        Ok(CommandResult::new(CommandExit::failure(
+            "objective start is not wired until objective service integration",
+        )))
+    }
+
+    fn start_objective_streaming(
+        &self,
+        options: ObjectiveStartOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        let result = self.start_objective(options)?;
+        for event in &result.events {
+            sink.event(event)?;
+        }
+        Ok(result)
+    }
+
+    fn get_objective_plan(
+        &self,
+        _objective_id: &crate::domain::ObjectiveId,
+    ) -> HarnessResult<CommandResult> {
+        Ok(CommandResult::new(CommandExit::failure(
+            "objective plan is not wired until objective service integration",
+        )))
+    }
+
+    fn validate_objective(
+        &self,
+        _objective_id: &crate::domain::ObjectiveId,
+        _options: ObjectiveValidateOptions,
+    ) -> HarnessResult<CommandResult> {
+        Ok(CommandResult::new(CommandExit::failure(
+            "objective validate is not wired until objective service integration",
+        )))
+    }
+
+    fn supervise_objective(
+        &self,
+        _objective_id: &crate::domain::ObjectiveId,
+        _options: ObjectiveSuperviseOptions,
+    ) -> HarnessResult<CommandResult> {
+        Ok(CommandResult::new(CommandExit::failure(
+            "objective supervise is not wired until objective monitor integration",
+        )))
+    }
+
+    fn supervise_objective_streaming(
+        &self,
+        objective_id: &crate::domain::ObjectiveId,
+        options: ObjectiveSuperviseOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        let result = self.supervise_objective(objective_id, options)?;
+        for event in &result.events {
+            sink.event(event)?;
+        }
+        Ok(result)
+    }
+
+    fn cancel_objective(
+        &self,
+        _objective_id: &crate::domain::ObjectiveId,
+    ) -> HarnessResult<CommandResult> {
+        Ok(CommandResult::new(CommandExit::failure(
+            "objective cancel is not wired until objective service integration",
+        )))
     }
 }
 
@@ -189,6 +271,14 @@ impl HarnessService for DefaultHarnessService {
         self.orchestrator.list_tasks()
     }
 
+    fn list_objectives(&self, status: Option<ObjectiveStatus>) -> HarnessResult<Vec<Objective>> {
+        self.orchestrator.list_objectives(status)
+    }
+
+    fn get_objective(&self, objective_id: &crate::domain::ObjectiveId) -> HarnessResult<Objective> {
+        self.orchestrator.get_objective(objective_id)
+    }
+
     fn get_task(&self, task_id: &TaskId) -> HarnessResult<Task> {
         self.orchestrator.get_task(task_id)
     }
@@ -244,6 +334,68 @@ impl HarnessService for DefaultHarnessService {
         options: SuperviseCreateOptions,
     ) -> HarnessResult<CommandResult> {
         self.orchestrator.create_and_supervise_task(options)
+    }
+
+    fn start_objective(&self, options: ObjectiveStartOptions) -> HarnessResult<CommandResult> {
+        self.orchestrator.start_objective(options)
+    }
+
+    fn start_objective_streaming(
+        &self,
+        options: ObjectiveStartOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        let supervise = options.supervise;
+        let supervise_options = ObjectiveSuperviseOptions {
+            runtime: options.runtime.clone(),
+            worker_model: options.worker_model.clone(),
+            ticket_model: options.ticket_model.clone(),
+            max_worker_attempts: options.max_worker_attempts,
+            max_cycles: options.max_cycles,
+        };
+        let start_result = self.orchestrator.start_objective_streaming(options, sink)?;
+        if !supervise || start_result.exit.code() != 0 {
+            return Ok(start_result);
+        }
+
+        let objective_id = start_result
+            .data
+            .get("objective_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                HarnessError::External("objective start did not return an objective_id".to_string())
+            })
+            .and_then(ObjectiveId::parse)?;
+        let supervise_result = self
+            .orchestrator
+            .supervise_objective(&objective_id, supervise_options)?;
+        for event in &supervise_result.events {
+            sink.event(event)?;
+        }
+        Ok(supervise_result)
+    }
+
+    fn get_objective_plan(
+        &self,
+        objective_id: &crate::domain::ObjectiveId,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator.get_objective_plan(objective_id)
+    }
+
+    fn validate_objective(
+        &self,
+        objective_id: &crate::domain::ObjectiveId,
+        options: ObjectiveValidateOptions,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator.validate_objective(objective_id, options)
+    }
+
+    fn supervise_objective(
+        &self,
+        objective_id: &crate::domain::ObjectiveId,
+        options: ObjectiveSuperviseOptions,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator.supervise_objective(objective_id, options)
     }
 
     fn create_and_supervise_task_streaming(

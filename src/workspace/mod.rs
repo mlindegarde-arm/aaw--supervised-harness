@@ -4,6 +4,7 @@ use crate::error::HarnessError;
 use crate::patch::{PatchValidationConfig, validate_patch_safety};
 use crate::security::{DefaultEnvironmentSanitizer, EnvironmentSanitizer};
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -486,7 +487,13 @@ fn git_output_allow_exit<const N: usize>(
 
 fn run_command(spec: CommandSpec) -> HarnessResult<CommandOutput> {
     let started = Instant::now();
-    let sanitized_env = DefaultEnvironmentSanitizer::new().sanitize(&spec.env);
+    let mut sanitized_env = DefaultEnvironmentSanitizer::new().sanitize(&spec.env);
+    if !sanitized_env.contains_key("PATH")
+        && let Ok(path) = env::var("PATH")
+    {
+        sanitized_env.insert("PATH".to_string(), path);
+    }
+    sanitize_path_env(&mut sanitized_env);
     let mut command = Command::new(&spec.shell_path);
     command
         .env_clear()
@@ -568,6 +575,27 @@ fn run_command(spec: CommandSpec) -> HarnessResult<CommandOutput> {
         truncated: stdout.truncated || stderr.truncated,
         truncated_bytes,
     })
+}
+
+fn sanitize_path_env(env: &mut BTreeMap<String, String>) {
+    let Some(path) = env.get("PATH").cloned() else {
+        return;
+    };
+    let paths = env::split_paths(&path)
+        .filter(|path| path.is_absolute())
+        .filter(|path| {
+            path.components()
+                .all(|component| component != std::path::Component::CurDir)
+        })
+        .collect::<Vec<_>>();
+    match env::join_paths(paths) {
+        Ok(path) if !path.is_empty() => {
+            env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+        }
+        _ => {
+            env.remove("PATH");
+        }
+    }
 }
 
 fn terminate_child(child: &mut std::process::Child, kill_process_group: bool) {
@@ -1121,6 +1149,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.stdout, "kept::");
+    }
+
+    #[test]
+    fn command_runner_preserves_parent_path_when_unspecified() {
+        let repo = test_repo();
+        let manager = manager_for(&repo);
+        let output = manager
+            .run_validation(CommandSpec {
+                command: "command -v cargo >/dev/null".to_string(),
+                cwd: path_to_string(repo.path()),
+                shell_path: "/bin/sh".to_string(),
+                env: BTreeMap::new(),
+                timeout_seconds: 5,
+                max_output_bytes: 100,
+                stdin: CommandStdin::Null,
+                kill_process_group_on_timeout: true,
+            })
+            .unwrap();
+
+        assert_eq!(output.exit_code, Some(0), "{output:?}");
+    }
+
+    #[test]
+    fn command_runner_drops_relative_path_entries() {
+        let repo = test_repo();
+        let manager = manager_for(&repo);
+        let output = manager
+            .run_validation(CommandSpec {
+                command: "printf '%s' \"$PATH\"".to_string(),
+                cwd: path_to_string(repo.path()),
+                shell_path: "/bin/sh".to_string(),
+                env: BTreeMap::from([(
+                    "PATH".to_string(),
+                    env::join_paths(["relative", "/bin", ".", "/usr/bin"])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )]),
+                timeout_seconds: 5,
+                max_output_bytes: 1_000,
+                stdin: CommandStdin::Null,
+                kill_process_group_on_timeout: true,
+            })
+            .unwrap();
+
+        let paths = env::split_paths(&output.stdout).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")]
+        );
     }
 
     #[test]

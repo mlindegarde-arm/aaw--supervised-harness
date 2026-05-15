@@ -1,24 +1,38 @@
+pub mod objective;
 pub mod supervisor;
 pub mod supervisor_state;
 
 use crate::domain::{
     Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus, Event, EventId, EventLevel,
-    HarnessConfig, Run, RunId, RunStatus, Task, TaskId, TaskStatus, Ticket, TicketId,
+    HarnessConfig, ObjectiveAcceptanceCriterionId, ObjectiveAcceptanceStatus, ObjectiveArtifactId,
+    ObjectiveEventId, ObjectiveId, ObjectiveMessageId, ObjectivePlanId, ObjectiveStatus,
+    ObjectiveValidationCommandId, ObjectiveValidationCommandSource, PlannerExchangeId,
+    PlannerExchangeKind, Run, RunId, RunStatus, Task, TaskId, TaskStatus, Ticket, TicketId,
     TicketResolution, TicketResolutionId, TicketStatus,
 };
 use crate::patch::{OllamaResponse, parse_ollama_response};
+use crate::planner::{
+    ContextBudget, ContextBudgetClass, ContextPackRequest, ContextSection, PlannerResponse,
+    build_planner_request, pack_context, parse_planner_response_for_repo,
+};
 use crate::prompts::{
     ArtifactManifestContext, OllamaPromptRequest, TicketPromptRequest,
     build_artifact_manifest_with_context,
 };
-use crate::prompts::{build_ollama_worker_prompt, build_ticket_prompt};
+use crate::prompts::{build_ollama_worker_prompt, build_planner_prompt, build_ticket_prompt};
 use crate::providers::{ModelProvider, ModelRequest, ModelResponse, ProviderError};
 use crate::runtime::{
-    CommandEvent, CommandExit, CommandResult, CommandStatus, ResumeTaskOptions, TaskRunOptions,
-    TicketResolveOptions,
+    CommandEvent, CommandEventLevel, CommandExit, CommandResult, CommandStatus,
+    ObjectiveProgressKind, ObjectiveProgressPhase, ObjectivePromptInput, ObjectiveStartOptions,
+    OutputSink, ResumeTaskOptions, TaskRunOptions, TicketResolveOptions,
 };
-use crate::security::{DefaultRedactor, Redactor};
-use crate::state::{RunUpdate, TaskStore};
+use crate::security::{DefaultRedactor, Redactor, ValidationCommandPolicy};
+use crate::state::{
+    NewGeneratedTask, NewObjectiveMessage, NewObjectiveTaskDependency, Objective,
+    ObjectiveAcceptanceCriterion, ObjectiveArtifact, ObjectiveEvent, ObjectivePlan,
+    ObjectivePlanBundle, ObjectiveStatusUpdate, ObjectiveTaskValidationCommand,
+    ObjectiveValidationCommand, PlannerExchange, RejectedPlannerExchange, RunUpdate, TaskStore,
+};
 use crate::workspace::{
     CommandRunner, CommandSpec, CommandStdin, PatchCheck, RecordedWorktree, WorkspaceManager,
     WorktreeRequest,
@@ -154,8 +168,545 @@ impl RunOrchestrator {
         self.store.list_tasks(None)
     }
 
+    pub fn list_objectives(
+        &self,
+        status: Option<ObjectiveStatus>,
+    ) -> HarnessResult<Vec<Objective>> {
+        self.store.list_objectives(status)
+    }
+
+    pub fn get_objective(&self, objective_id: &ObjectiveId) -> HarnessResult<Objective> {
+        self.store.get_objective(objective_id)
+    }
+
+    pub fn get_objective_plan(&self, objective_id: &ObjectiveId) -> HarnessResult<CommandResult> {
+        let objective = self.store.get_objective(objective_id)?;
+        let exchanges = self.store.list_planner_exchanges(objective_id)?;
+        let artifacts = self.store.list_objective_artifacts(objective_id)?;
+        let messages = self.store.list_objective_messages(objective_id)?;
+        let events = self.store.list_objective_events(objective_id)?;
+        Ok(CommandResult::with_data(
+            CommandExit::success(),
+            json!({
+                "objective_id": objective.id.as_str(),
+                "active_plan_id": objective.active_plan_id.as_ref().map(ObjectivePlanId::as_str),
+                "summary": objective.summary,
+                "planner_exchanges": exchanges.iter().map(|exchange| json!({
+                    "id": exchange.id.as_str(),
+                    "kind": exchange.kind.as_str(),
+                    "ticket_id": exchange.ticket_id.as_ref().map(TicketId::as_str),
+                    "model": exchange.model,
+                    "status": exchange.status,
+                    "error": exchange.error,
+                    "created_at": exchange.created_at,
+                })).collect::<Vec<_>>(),
+                "artifacts": artifacts.iter().map(|artifact| json!({
+                    "id": artifact.id.as_str(),
+                    "kind": artifact.kind,
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                    "byte_len": artifact.byte_len,
+                    "created_at": artifact.created_at,
+                })).collect::<Vec<_>>(),
+                "messages": messages.iter().map(|message| json!({
+                    "id": message.id.as_str(),
+                    "sequence": message.sequence,
+                    "role": message.role,
+                    "kind": message.kind,
+                    "content_preview": message.content_preview,
+                    "created_at": message.created_at,
+                })).collect::<Vec<_>>(),
+                "events": events.iter().map(|event| json!({
+                    "id": event.id.as_str(),
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "payload_json": event.payload_json,
+                    "created_at": event.created_at,
+                })).collect::<Vec<_>>(),
+                "next": format!("harness objective supervise {}", objective.id.as_str()),
+            }),
+        ))
+    }
+
+    pub fn start_objective(&self, options: ObjectiveStartOptions) -> HarnessResult<CommandResult> {
+        self.start_objective_inner(options, None)
+    }
+
+    pub fn start_objective_streaming(
+        &self,
+        options: ObjectiveStartOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        self.start_objective_inner(options, Some(sink))
+    }
+
+    fn start_objective_inner(
+        &self,
+        options: ObjectiveStartOptions,
+        mut sink: Option<&mut dyn OutputSink>,
+    ) -> HarnessResult<CommandResult> {
+        let prompt = self.resolve_objective_prompt(&options.prompt)?;
+        if prompt.trim().is_empty() {
+            return Err(HarnessError::Usage(
+                "objective prompt cannot be empty".to_string(),
+            ));
+        }
+        let repo_root = self.workspace.discover_repo_root(
+            options
+                .runtime
+                .repo
+                .as_deref()
+                .and_then(|path| path.to_str()),
+        )?;
+        let created_at = now();
+        let objective_id = new_id(ObjectiveId::PREFIX, ObjectiveId::parse)?;
+        let objective = Objective {
+            id: objective_id.clone(),
+            title: title_from_prompt(&prompt),
+            prompt: self.redact_text(&prompt),
+            summary: "Planning objective".to_string(),
+            status: ObjectiveStatus::Planning,
+            planner_model: Some(
+                options
+                    .planner_model
+                    .clone()
+                    .unwrap_or_else(|| self.config.providers.openai.default_model.clone()),
+            ),
+            worker_model: Some(
+                options
+                    .worker_model
+                    .clone()
+                    .unwrap_or_else(|| self.config.providers.ollama.default_model.clone()),
+            ),
+            ticket_model: options.ticket_model.clone(),
+            active_plan_id: None,
+            monitor_lease_owner: None,
+            monitor_lease_expires_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+        };
+        self.store.insert_objective(objective.clone())?;
+
+        let planning_started = objective_progress(
+            ObjectiveProgressKind::PlanningStarted,
+            &objective_id,
+            ObjectiveProgressPhase::Planning,
+            ObjectiveStatus::Planning,
+            "planning objective",
+        );
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.event(&CommandEvent::objective_progress(
+                planning_started.clone(),
+                CommandEventLevel::Info,
+            ))?;
+        }
+
+        let context = pack_context(ContextPackRequest {
+            budget: ContextBudget {
+                total_bytes: 32 * 1024,
+                objective_bytes: 8 * 1024,
+                conversation_bytes: 4 * 1024,
+                state_bytes: 8 * 1024,
+                artifact_excerpt_bytes: 4 * 1024,
+                schema_bytes: 8 * 1024,
+            },
+            sections: vec![
+                ContextSection {
+                    label: "objective_prompt".to_string(),
+                    priority: 0,
+                    budget_class: ContextBudgetClass::Objective,
+                    required: true,
+                    body: self.redact_text(&prompt),
+                },
+                ContextSection {
+                    label: "repository".to_string(),
+                    priority: 10,
+                    budget_class: ContextBudgetClass::State,
+                    required: false,
+                    body: format!("repo_root: {repo_root}"),
+                },
+            ],
+            artifacts: Vec::new(),
+        })?;
+        let planner_request = build_planner_request(
+            self.redact_text(&prompt),
+            context.body.clone(),
+            context.manifest,
+        );
+        let planner_prompt = build_planner_prompt(planner_request)?;
+        let request_text = planner_prompt.input.clone();
+        let planner_model = objective.planner_model.clone().unwrap_or_default();
+        let exchange_id = new_id(PlannerExchangeId::PREFIX, PlannerExchangeId::parse)?;
+        let request_artifact = self.write_objective_artifact(
+            &objective_id,
+            None,
+            Some(&exchange_id),
+            "planner_request",
+            "planner-request.json",
+            &request_text,
+        )?;
+        let response = match block_on(self.openai.complete(ModelRequest {
+            model: planner_model.clone(),
+            system: planner_prompt.system,
+            input: planner_prompt.input,
+            temperature: Some(0.0),
+            max_output_tokens: Some(self.config.providers.openai.max_output_tokens),
+            metadata: BTreeMap::from([
+                ("role".to_string(), "objective_planner".to_string()),
+                (
+                    "objective_id".to_string(),
+                    objective_id.as_str().to_string(),
+                ),
+            ]),
+        })) {
+            Ok(response) => response,
+            Err(error) => {
+                let error = HarnessError::External(provider_error(error));
+                self.persist_failed_planner_call(
+                    &objective_id,
+                    exchange_id,
+                    planner_model,
+                    request_artifact,
+                    error.to_string(),
+                )?;
+                let result = objective_failure_result(
+                    &objective_id,
+                    planning_started,
+                    ObjectiveProgressKind::Failed,
+                    ObjectiveProgressPhase::Failed,
+                    ObjectiveStatus::Failed,
+                    error,
+                );
+                stream_objective_start_result(&mut sink, &result)?;
+                return Ok(result);
+            }
+        };
+
+        let plan_id = new_id(ObjectivePlanId::PREFIX, ObjectivePlanId::parse)?;
+        let response_artifact = self.write_objective_artifact(
+            &objective_id,
+            None,
+            Some(&exchange_id),
+            "planner_response",
+            "planner-response.json",
+            &response.text,
+        )?;
+
+        let parsed = match parse_planner_response_for_repo(&response.text, &repo_root) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.persist_rejected_plan(
+                    &objective_id,
+                    exchange_id,
+                    planner_model,
+                    request_artifact,
+                    response_artifact,
+                    error.to_string(),
+                )?;
+                let result = objective_failure_result(
+                    &objective_id,
+                    planning_started,
+                    ObjectiveProgressKind::PlanRejected,
+                    ObjectiveProgressPhase::Failed,
+                    ObjectiveStatus::Failed,
+                    error,
+                );
+                stream_objective_start_result(&mut sink, &result)?;
+                return Ok(result);
+            }
+        };
+
+        let bundle = match self.build_plan_bundle(
+            &objective,
+            plan_id,
+            exchange_id.clone(),
+            planner_model.clone(),
+            parsed,
+            request_artifact.clone(),
+            response_artifact.clone(),
+            &repo_root,
+            options
+                .max_worker_attempts
+                .unwrap_or(self.config.orchestrator.max_attempts),
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.persist_rejected_plan(
+                    &objective_id,
+                    exchange_id,
+                    planner_model,
+                    request_artifact,
+                    response_artifact,
+                    error.to_string(),
+                )?;
+                let result = objective_failure_result(
+                    &objective_id,
+                    planning_started,
+                    ObjectiveProgressKind::PlanRejected,
+                    ObjectiveProgressPhase::Failed,
+                    ObjectiveStatus::Failed,
+                    error,
+                );
+                stream_objective_start_result(&mut sink, &result)?;
+                return Ok(result);
+            }
+        };
+        let bundle_result = self
+            .store
+            .create_objective_plan_bundle(&objective_id, bundle)?;
+        let task_ids = bundle_result
+            .tasks
+            .iter()
+            .map(|task| task.task_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        let result = CommandResult::with_data(
+            CommandExit::success(),
+            json!({
+                "objective_id": objective_id.as_str(),
+                "plan_id": bundle_result.plan.id.as_str(),
+                "status": bundle_result.objective.status.as_str(),
+                "terminal": false,
+                "task_ids": task_ids,
+                "open_ticket_ids": [],
+                "validation": {
+                    "status": "pending",
+                    "commands_run": 0,
+                    "commands_skipped": 0,
+                },
+                "next": format!("harness objective supervise {}", objective_id.as_str()),
+            }),
+        )
+        .with_event(CommandEvent::objective_progress(
+            planning_started,
+            CommandEventLevel::Info,
+        ))
+        .with_event(CommandEvent::objective_progress(
+            objective_progress(
+                ObjectiveProgressKind::PlanningCompleted,
+                &objective_id,
+                ObjectiveProgressPhase::Ready,
+                ObjectiveStatus::Ready,
+                "objective plan accepted",
+            ),
+            CommandEventLevel::Info,
+        ));
+        stream_objective_start_result(&mut sink, &result)?;
+        Ok(result)
+    }
+
     pub fn get_task(&self, task_id: &TaskId) -> HarnessResult<Task> {
         self.store.get_task(task_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_plan_bundle(
+        &self,
+        objective: &Objective,
+        plan_id: ObjectivePlanId,
+        exchange_id: PlannerExchangeId,
+        planner_model: String,
+        response: PlannerResponse,
+        request_artifact: ObjectiveArtifact,
+        response_artifact: ObjectiveArtifact,
+        repo_root: &str,
+        worker_attempt_budget: u32,
+    ) -> HarnessResult<ObjectivePlanBundle> {
+        let policy = ValidationCommandPolicy::new();
+        let created_at = now();
+        let plan = ObjectivePlan {
+            id: plan_id.clone(),
+            objective_id: objective.id.clone(),
+            version: 1,
+            summary: response.objective.summary.clone(),
+            created_at: created_at.clone(),
+        };
+        let acceptance_criteria = response
+            .objective
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| {
+                Ok(ObjectiveAcceptanceCriterion {
+                    id: new_id(
+                        ObjectiveAcceptanceCriterionId::PREFIX,
+                        ObjectiveAcceptanceCriterionId::parse,
+                    )?,
+                    objective_id: objective.id.clone(),
+                    plan_id: plan_id.clone(),
+                    description: criterion.clone(),
+                    status: ObjectiveAcceptanceStatus::Pending,
+                    last_evaluated_at: None,
+                })
+            })
+            .collect::<HarnessResult<Vec<_>>>()?;
+        let validation_commands = response
+            .objective
+            .validation_commands
+            .iter()
+            .map(|command| {
+                let review = policy.classify(command);
+                Ok(ObjectiveValidationCommand {
+                    id: new_id(
+                        ObjectiveValidationCommandId::PREFIX,
+                        ObjectiveValidationCommandId::parse,
+                    )?,
+                    objective_id: objective.id.clone(),
+                    plan_id: plan_id.clone(),
+                    command: command.clone(),
+                    source: ObjectiveValidationCommandSource::Planner,
+                    review_status: review.review_status(),
+                    review_reason: (!review.reasons.is_empty()).then(|| review.reasons.join("; ")),
+                    created_at: created_at.clone(),
+                })
+            })
+            .collect::<HarnessResult<Vec<_>>>()?;
+
+        let mut key_to_task_id = BTreeMap::new();
+        for task in &response.tasks {
+            key_to_task_id.insert(
+                task.task_key.clone(),
+                new_id(TaskId::PREFIX, TaskId::parse)?,
+            );
+        }
+
+        let mut generated_tasks = Vec::new();
+        for (sequence, task) in response.tasks.iter().enumerate() {
+            let task_id = key_to_task_id
+                .get(&task.task_key)
+                .expect("task key was prepopulated")
+                .clone();
+            let mut trusted_validation_commands = Vec::new();
+            let mut reviewed_validation_commands = Vec::new();
+            for command in &task.validation {
+                let review = policy.classify(command);
+                if review.executable_argv().is_some() {
+                    trusted_validation_commands.push(command.clone());
+                } else {
+                    reviewed_validation_commands.push(ObjectiveTaskValidationCommand {
+                        id: new_id(
+                            ObjectiveValidationCommandId::PREFIX,
+                            ObjectiveValidationCommandId::parse,
+                        )?,
+                        objective_id: objective.id.clone(),
+                        task_id: task_id.clone(),
+                        command: command.clone(),
+                        review_status: review.review_status(),
+                        review_reason: Some(review.reasons.join("; ")),
+                        created_at: created_at.clone(),
+                    });
+                }
+            }
+            if trusted_validation_commands.is_empty() {
+                return Err(HarnessError::SecurityPolicy(format!(
+                    "planner task {} has no trusted validation command",
+                    task.task_key
+                )));
+            }
+            generated_tasks.push(NewGeneratedTask {
+                task: Task {
+                    id: task_id.clone(),
+                    title: self.redact_text(&task.title),
+                    goal: self.redact_text(&task.goal),
+                    status: TaskStatus::Ready,
+                    repo_root: repo_root.to_string(),
+                    worktree_path: None,
+                    branch: None,
+                    base_ref: Some("HEAD".to_string()),
+                    base_commit: None,
+                    last_seen_head: None,
+                    max_attempts: worker_attempt_budget,
+                    lease_owner: None,
+                    lease_acquired_at: None,
+                    lease_expires_at: None,
+                    heartbeat_at: None,
+                    lock_version: 0,
+                    created_at: created_at.clone(),
+                    updated_at: created_at.clone(),
+                },
+                task_key: task.task_key.clone(),
+                parallel_group: Some(task.parallel_group.clone()),
+                owned_paths_json: serde_json::to_string(&task.owned_paths).map_err(|error| {
+                    HarnessError::External(format!("serialize owned paths: {error}"))
+                })?,
+                sequence: sequence as u32,
+                worker_attempt_budget,
+                trusted_validation_commands,
+                reviewed_validation_commands,
+            });
+        }
+
+        let dependencies = response
+            .tasks
+            .iter()
+            .flat_map(|task| {
+                task.depends_on
+                    .iter()
+                    .map(|dependency| NewObjectiveTaskDependency {
+                        task_id: key_to_task_id
+                            .get(&task.task_key)
+                            .expect("task key exists")
+                            .clone(),
+                        depends_on_task_id: key_to_task_id
+                            .get(dependency)
+                            .expect("dependency key validated")
+                            .clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ObjectivePlanBundle {
+            objective_updated_at: created_at.clone(),
+            plan,
+            acceptance_criteria,
+            validation_commands,
+            generated_tasks,
+            dependencies,
+            artifacts: vec![request_artifact.clone(), response_artifact.clone()],
+            exchange: PlannerExchange {
+                id: exchange_id,
+                objective_id: objective.id.clone(),
+                kind: PlannerExchangeKind::InitialPlan,
+                ticket_id: None,
+                model: planner_model,
+                system_prompt_version: crate::prompts::PROMPT_CONTRACT_VERSION.to_string(),
+                request_objective_artifact_id: Some(request_artifact.id),
+                response_objective_artifact_id: Some(response_artifact.id.clone()),
+                status: "accepted".to_string(),
+                error: None,
+                created_at: created_at.clone(),
+            },
+            messages: vec![
+                NewObjectiveMessage {
+                    id: new_id(ObjectiveMessageId::PREFIX, ObjectiveMessageId::parse)?,
+                    objective_id: objective.id.clone(),
+                    role: "user".to_string(),
+                    kind: "prompt".to_string(),
+                    content_objective_artifact_id: None,
+                    content_preview: objective.prompt.chars().take(512).collect(),
+                    created_at: created_at.clone(),
+                },
+                NewObjectiveMessage {
+                    id: new_id(ObjectiveMessageId::PREFIX, ObjectiveMessageId::parse)?,
+                    objective_id: objective.id.clone(),
+                    role: "planner".to_string(),
+                    kind: "response".to_string(),
+                    content_objective_artifact_id: Some(response_artifact.id.clone()),
+                    content_preview: response.objective.summary.chars().take(512).collect(),
+                    created_at: created_at.clone(),
+                },
+            ],
+            events: vec![ObjectiveEvent {
+                id: new_id(ObjectiveEventId::PREFIX, ObjectiveEventId::parse)?,
+                objective_id: objective.id.clone(),
+                event_type: "objective.plan_accepted".to_string(),
+                message: "objective plan accepted".to_string(),
+                payload_json: json!({
+                    "task_count": response.tasks.len(),
+                    "acceptance_criteria_count": response.objective.acceptance_criteria.len(),
+                })
+                .to_string(),
+                created_at,
+            }],
+        })
     }
 
     pub fn list_tickets(&self) -> HarnessResult<Vec<Ticket>> {
@@ -1434,6 +1985,142 @@ impl RunOrchestrator {
         Ok(artifact)
     }
 
+    fn resolve_objective_prompt(&self, input: &ObjectivePromptInput) -> HarnessResult<String> {
+        match input {
+            ObjectivePromptInput::Text(text) => Ok(text.clone()),
+            ObjectivePromptInput::File(path) => fs::read_to_string(path)
+                .map_err(|error| HarnessError::External(format!("read prompt file: {error}"))),
+            ObjectivePromptInput::Stdin => Err(HarnessError::Usage(
+                "objective start --stdin must be resolved by the CLI input layer".to_string(),
+            )),
+        }
+    }
+
+    fn write_objective_artifact(
+        &self,
+        objective_id: &ObjectiveId,
+        plan_id: Option<&ObjectivePlanId>,
+        exchange_id: Option<&PlannerExchangeId>,
+        kind: &str,
+        name: &str,
+        text: &str,
+    ) -> HarnessResult<ObjectiveArtifact> {
+        let dir = PathBuf::from(&self.config.workspace.state_dir)
+            .join("objective-artifacts")
+            .join(objective_id.as_str());
+        fs::create_dir_all(&dir).map_err(|error| {
+            HarnessError::External(format!("create objective artifact dir: {error}"))
+        })?;
+        let path = dir.join(name);
+        let redacted = self.redactor.redact(text).text;
+        fs::write(&path, &redacted).map_err(|error| {
+            HarnessError::External(format!("write objective artifact: {error}"))
+        })?;
+        Ok(ObjectiveArtifact {
+            id: new_id(ObjectiveArtifactId::PREFIX, ObjectiveArtifactId::parse)?,
+            objective_id: objective_id.clone(),
+            plan_id: plan_id.cloned(),
+            planner_exchange_id: exchange_id.cloned(),
+            kind: kind.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            sha256: fingerprint_bytes(redacted.as_bytes()),
+            byte_len: redacted.len() as u64,
+            created_at: now(),
+        })
+    }
+
+    fn persist_rejected_plan(
+        &self,
+        objective_id: &ObjectiveId,
+        exchange_id: PlannerExchangeId,
+        planner_model: String,
+        request_artifact: ObjectiveArtifact,
+        response_artifact: ObjectiveArtifact,
+        error: String,
+    ) -> HarnessResult<()> {
+        let created_at = now();
+        self.store.reject_objective_plan(
+            objective_id,
+            RejectedPlannerExchange {
+                artifacts: vec![request_artifact.clone(), response_artifact.clone()],
+                exchange: PlannerExchange {
+                    id: exchange_id,
+                    objective_id: objective_id.clone(),
+                    kind: PlannerExchangeKind::InitialPlan,
+                    ticket_id: None,
+                    model: planner_model,
+                    system_prompt_version: crate::prompts::PROMPT_CONTRACT_VERSION.to_string(),
+                    request_objective_artifact_id: Some(request_artifact.id),
+                    response_objective_artifact_id: Some(response_artifact.id.clone()),
+                    status: "rejected".to_string(),
+                    error: Some(error.clone()),
+                    created_at: created_at.clone(),
+                },
+                messages: vec![NewObjectiveMessage {
+                    id: new_id(ObjectiveMessageId::PREFIX, ObjectiveMessageId::parse)?,
+                    objective_id: objective_id.clone(),
+                    role: "planner".to_string(),
+                    kind: "rejected_response".to_string(),
+                    content_objective_artifact_id: Some(response_artifact.id),
+                    content_preview: error.chars().take(512).collect(),
+                    created_at: created_at.clone(),
+                }],
+            },
+            ObjectiveEvent {
+                id: new_id(ObjectiveEventId::PREFIX, ObjectiveEventId::parse)?,
+                objective_id: objective_id.clone(),
+                event_type: "objective.plan_rejected".to_string(),
+                message: "objective plan rejected".to_string(),
+                payload_json: json!({ "error": error }).to_string(),
+                created_at,
+            },
+        )
+    }
+
+    fn persist_failed_planner_call(
+        &self,
+        objective_id: &ObjectiveId,
+        exchange_id: PlannerExchangeId,
+        planner_model: String,
+        request_artifact: ObjectiveArtifact,
+        error: String,
+    ) -> HarnessResult<()> {
+        let created_at = now();
+        self.store
+            .insert_objective_artifact(request_artifact.clone())?;
+        self.store.insert_planner_exchange(PlannerExchange {
+            id: exchange_id,
+            objective_id: objective_id.clone(),
+            kind: PlannerExchangeKind::InitialPlan,
+            ticket_id: None,
+            model: planner_model,
+            system_prompt_version: crate::prompts::PROMPT_CONTRACT_VERSION.to_string(),
+            request_objective_artifact_id: Some(request_artifact.id),
+            response_objective_artifact_id: None,
+            status: "failed".to_string(),
+            error: Some(error.clone()),
+            created_at: created_at.clone(),
+        })?;
+        self.store.update_objective_status(
+            objective_id,
+            Some(ObjectiveStatus::Planning),
+            ObjectiveStatusUpdate {
+                status: Some(ObjectiveStatus::Failed),
+                summary: Some(error.clone()),
+                updated_at: Some(created_at.clone()),
+                ..ObjectiveStatusUpdate::default()
+            },
+        )?;
+        self.store.insert_objective_event(ObjectiveEvent {
+            id: new_id(ObjectiveEventId::PREFIX, ObjectiveEventId::parse)?,
+            objective_id: objective_id.clone(),
+            event_type: "objective.failed".to_string(),
+            message: "objective planner call failed".to_string(),
+            payload_json: json!({ "error": error }).to_string(),
+            created_at,
+        })
+    }
+
     fn write_attempt_manifest(
         &self,
         task_id: &TaskId,
@@ -1570,6 +2257,115 @@ fn owner(task_id: &TaskId) -> String {
     format!("orchestrator-{}-{}", std::process::id(), task_id.as_str())
 }
 
+fn title_from_prompt(prompt: &str) -> String {
+    let title = prompt
+        .lines()
+        .next()
+        .unwrap_or("Objective")
+        .trim()
+        .chars()
+        .take(96)
+        .collect::<String>();
+    if title.is_empty() {
+        "Objective".to_string()
+    } else {
+        title
+    }
+}
+
+fn objective_progress(
+    kind: ObjectiveProgressKind,
+    objective_id: &ObjectiveId,
+    phase: ObjectiveProgressPhase,
+    status: ObjectiveStatus,
+    message: impl Into<String>,
+) -> crate::runtime::ObjectiveProgressEvent {
+    let mut event = crate::runtime::ObjectiveProgressEvent::new(
+        kind,
+        objective_id.clone(),
+        phase,
+        status,
+        message,
+        now(),
+    );
+    event.next_command = Some(format!(
+        "harness objective get {} --output json",
+        objective_id
+    ));
+    event
+}
+
+fn stream_objective_start_result(
+    sink: &mut Option<&mut dyn OutputSink>,
+    result: &CommandResult,
+) -> HarnessResult<()> {
+    let Some(sink) = sink.as_deref_mut() else {
+        return Ok(());
+    };
+    for event in &result.events {
+        if event
+            .objective_progress
+            .as_ref()
+            .is_some_and(|progress| progress.kind == ObjectiveProgressKind::PlanningStarted)
+        {
+            continue;
+        }
+        sink.event(event)?;
+    }
+    Ok(())
+}
+
+fn objective_failure_result(
+    objective_id: &ObjectiveId,
+    planning_started: crate::runtime::ObjectiveProgressEvent,
+    kind: ObjectiveProgressKind,
+    phase: ObjectiveProgressPhase,
+    status: ObjectiveStatus,
+    error: HarnessError,
+) -> CommandResult {
+    let exit = exit_for_error(&error);
+    let message = error.to_string();
+    CommandResult::with_data(
+        exit,
+        json!({
+            "objective_id": objective_id.as_str(),
+            "status": status.as_str(),
+            "terminal": true,
+            "exit_reason": message,
+            "task_ids": [],
+            "open_ticket_ids": [],
+            "validation": {
+                "status": "skipped",
+                "commands_run": 0,
+                "commands_skipped": 0,
+            },
+            "next": format!("harness objective get {}", objective_id.as_str()),
+        }),
+    )
+    .with_event(CommandEvent::objective_progress(
+        planning_started,
+        CommandEventLevel::Info,
+    ))
+    .with_event(CommandEvent::objective_progress(
+        objective_progress(kind, objective_id, phase, status, message),
+        CommandEventLevel::Error,
+    ))
+}
+
+fn exit_for_error(error: &HarnessError) -> CommandExit {
+    match error {
+        HarnessError::Usage(_)
+        | HarnessError::InvalidId { .. }
+        | HarnessError::InvalidStatus { .. }
+        | HarnessError::InvalidConfig(_) => CommandExit::usage(error.to_string()),
+        HarnessError::SecurityPolicy(_) => CommandExit::security_blocked(error.to_string()),
+        HarnessError::Conflict(_) => CommandExit::leased(error.to_string()),
+        HarnessError::NotFound { .. } | HarnessError::External(_) => {
+            CommandExit::failure(error.to_string())
+        }
+    }
+}
+
 fn stable_ticket_evidence(
     task: &Task,
     run: &Run,
@@ -1613,6 +2409,10 @@ fn now() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+pub(crate) fn orchestrator_now() -> String {
+    now()
 }
 
 fn new_id<T>(prefix: &'static str, parse: impl Fn(String) -> HarnessResult<T>) -> HarnessResult<T> {
@@ -1688,8 +2488,10 @@ fn noop_waker() -> Waker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ObjectiveValidationReviewStatus;
     use crate::providers::{FakeModelProvider, ProviderErrorKind};
-    use crate::state::SqliteTaskStore;
+    use crate::runtime::{CooperativeCancellationToken, ObjectiveSuperviseOptions, RuntimeOptions};
+    use crate::state::{ObjectiveStore, SqliteTaskStore};
     use crate::workspace::{CommandOutput, PatchApplyResult, PatchCheckResult, WorktreeInfo};
     use std::sync::Mutex;
 
@@ -1717,8 +2519,8 @@ mod tests {
     }
 
     impl WorkspaceManager for FakeWorkspace {
-        fn discover_repo_root(&self, _repo: Option<&str>) -> HarnessResult<String> {
-            Ok(self.repo_root.clone())
+        fn discover_repo_root(&self, repo: Option<&str>) -> HarnessResult<String> {
+            Ok(repo.unwrap_or(&self.repo_root).to_string())
         }
 
         fn source_is_dirty(&self, _repo_root: &str) -> HarnessResult<bool> {
@@ -1806,6 +2608,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeRunner {
         outputs: Mutex<Vec<CommandOutput>>,
+        errors: Mutex<Vec<String>>,
+        specs: Mutex<Vec<CommandSpec>>,
     }
 
     impl FakeRunner {
@@ -1820,10 +2624,18 @@ mod tests {
                 truncated_bytes: 0,
             });
         }
+
+        fn error_once(&self, message: impl Into<String>) {
+            self.errors.lock().unwrap().push(message.into());
+        }
     }
 
     impl CommandRunner for FakeRunner {
-        fn run_validation(&self, _spec: CommandSpec) -> HarnessResult<CommandOutput> {
+        fn run_validation(&self, spec: CommandSpec) -> HarnessResult<CommandOutput> {
+            self.specs.lock().unwrap().push(spec);
+            if let Some(error) = self.errors.lock().unwrap().pop() {
+                return Err(HarnessError::External(error));
+            }
             Ok(self
                 .outputs
                 .lock()
@@ -1857,9 +2669,17 @@ mod tests {
 
     impl Fixture {
         fn new(max_invalid: u32) -> Self {
+            Self::new_with_lease_ttl(max_invalid, 300)
+        }
+
+        fn new_with_lease_ttl(max_invalid: u32, lease_ttl_secs: i64) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let workspace = Arc::new(FakeWorkspace::new(&temp));
-            let store = Arc::new(SqliteTaskStore::in_memory().unwrap());
+            let store = Arc::new(
+                SqliteTaskStore::in_memory()
+                    .unwrap()
+                    .with_lease_ttl_secs(lease_ttl_secs),
+            );
             let runner = Arc::new(FakeRunner::default());
             let ollama = Arc::new(FakeModelProvider::new("fake-ollama"));
             let openai = Arc::new(FakeModelProvider::new("fake-openai"));
@@ -1921,6 +2741,1194 @@ mod tests {
             fixture.store.get_task(&task.id).unwrap().status,
             TaskStatus::Complete
         );
+    }
+
+    #[test]
+    fn start_objective_creates_plan_tasks_and_single_planner_call() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+
+        let result = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(7),
+                max_cycles: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(fixture.openai.requests().len(), 1);
+        assert_eq!(fixture.ollama.requests().len(), 0);
+        let objectives = fixture.store.list_objectives(None).unwrap();
+        assert_eq!(objectives.len(), 1);
+        assert_eq!(objectives[0].status, ObjectiveStatus::Ready);
+        assert!(objectives[0].active_plan_id.is_some());
+        let tasks = fixture.store.list_tasks(None).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.max_attempts == 7));
+        assert_eq!(
+            fixture
+                .store
+                .list_planner_exchanges(&objectives[0].id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_objective_artifacts(&objectives[0].id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(result.data["status"], "ready");
+        assert_eq!(result.data["task_ids"].as_array().unwrap().len(), 2);
+
+        let plan_view = fixture
+            .orchestrator
+            .get_objective_plan(&objectives[0].id)
+            .unwrap();
+        assert_eq!(plan_view.data["objective_id"], objectives[0].id.as_str());
+        assert_eq!(
+            plan_view.data["planner_exchanges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(plan_view.data["artifacts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn start_objective_rejects_plan_without_trusted_task_validation() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(unsafe_validation_planner_json());
+
+        let result = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::SecurityBlocked);
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(result.events[1].kind, "objective.plan_rejected");
+        let objectives = fixture.store.list_objectives(None).unwrap();
+        assert_eq!(objectives.len(), 1);
+        assert_eq!(objectives[0].status, ObjectiveStatus::Failed);
+        assert_eq!(fixture.store.list_tasks(None).unwrap().len(), 0);
+        assert_eq!(
+            fixture
+                .store
+                .list_planner_exchanges(&objectives[0].id)
+                .unwrap()[0]
+                .status,
+            "rejected"
+        );
+    }
+
+    #[test]
+    fn start_objective_marks_failed_when_planner_provider_fails() {
+        let fixture = Fixture::new(1);
+        fixture
+            .openai
+            .push_error(ProviderErrorKind::Timeout, "planner timed out");
+
+        let result = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(result.events[1].kind, "objective.failed");
+        let objectives = fixture.store.list_objectives(None).unwrap();
+        assert_eq!(objectives.len(), 1);
+        assert_eq!(objectives[0].status, ObjectiveStatus::Failed);
+        let exchanges = fixture
+            .store
+            .list_planner_exchanges(&objectives[0].id)
+            .unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].status, "failed");
+        assert_eq!(fixture.store.list_tasks(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn objective_monitor_completes_generated_tasks_sequentially() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: None,
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(result.data["status"], ObjectiveStatus::Complete.as_str());
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Complete
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_tasks(None)
+                .unwrap()
+                .iter()
+                .filter(|task| task.status == TaskStatus::Complete)
+                .count(),
+            2
+        );
+        assert!(fixture.ollama.requests().len() >= 2);
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| event.kind == "objective.completed")
+        );
+    }
+
+    #[test]
+    fn run_one_cycle_completes_one_ready_objective_task() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let cycle = fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: None,
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            cycle,
+            crate::orchestrator::objective::ObjectiveCycleResult::Progress(_)
+        ));
+        let tasks = fixture.store.list_tasks(None).unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Complete)
+                .count(),
+            1
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Ready)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn objective_cancellation_marks_objective_cancelled() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: None,
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        let token = CooperativeCancellationToken::new();
+        token.cancel();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective_with_cancellation(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: None,
+                    max_cycles: Some(8),
+                },
+                &token,
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(result.data["status"], ObjectiveStatus::Cancelled.as_str());
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Cancelled
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| event.kind == "objective.cancelled")
+        );
+    }
+
+    #[test]
+    fn objective_monitor_resolves_stuck_ticket_and_resumes_local_worker() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture
+            .openai
+            .push_text_with_id("resp_resolver", valid_resolver_json());
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: need advice\nquestion: What should change?");
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(fixture.openai.requests().len(), 2);
+        assert_eq!(
+            fixture
+                .openai
+                .requests()
+                .last()
+                .unwrap()
+                .metadata
+                .get("role")
+                .map(String::as_str),
+            Some("objective_ticket_resolver")
+        );
+        let tasks = fixture.store.list_tasks(None).unwrap();
+        assert!(tasks.iter().all(|task| task.status == TaskStatus::Complete));
+        let tickets = fixture.store.list_tickets(None, None).unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].status, TicketStatus::Resolved);
+        assert_eq!(
+            fixture
+                .store
+                .list_ticket_resolutions(&tickets[0].id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_resolver_attempts_for_ticket(&objective_id, &tickets[0].id)
+                .unwrap()[0]
+                .status,
+            "resolved"
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| event.kind == "objective.ticket_resolution_completed")
+        );
+    }
+
+    #[test]
+    fn objective_ticket_resolver_prompt_includes_objective_and_ticket_context() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.openai.push_text(valid_resolver_json());
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: missing command\nquestion: Which command is required?");
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(1),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+
+        let requests = fixture.openai.requests();
+        let request = requests.last().unwrap();
+        assert!(request.input.contains("\"ticket_details\""));
+        assert!(request.input.contains("Build a Rust CLI"));
+        assert!(request.input.contains("Which command is required?"));
+        assert!(request.input.contains("cargo test passes"));
+    }
+
+    #[test]
+    fn objective_ticket_resolver_rejects_patch_like_output_and_does_not_loop() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.openai.push_text(patch_like_resolver_json());
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: need advice\nquestion: What should change?");
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(1),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(fixture.openai.requests().len(), 2);
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Blocked
+        );
+        let tickets = fixture.store.list_tickets(None, None).unwrap();
+        assert_eq!(tickets[0].status, TicketStatus::Failed);
+        assert_eq!(
+            fixture
+                .store
+                .list_resolver_attempts_for_ticket(&objective_id, &tickets[0].id)
+                .unwrap()[0]
+                .status,
+            "failed"
+        );
+        let exchanges = fixture.store.list_planner_exchanges(&objective_id).unwrap();
+        assert!(exchanges.iter().any(|exchange| {
+            exchange.kind == PlannerExchangeKind::TicketResolution && exchange.status == "rejected"
+        }));
+    }
+
+    #[test]
+    fn objective_ticket_resolver_failed_attempt_is_not_retried_after_restart() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.openai.push_text(patch_like_resolver_json());
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: need advice\nquestion: What should change?");
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(1),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+        fixture.openai.push_text(valid_resolver_json());
+
+        let second = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(second.exit.status, CommandStatus::Failed);
+        assert_eq!(fixture.openai.requests().len(), 2);
+        let tickets = fixture.store.list_tickets(None, None).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .list_resolver_attempts_for_ticket(&objective_id, &tickets[0].id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn objective_monitor_enforces_worker_attempt_budget_before_resume() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.openai.push_text(valid_resolver_json());
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: need advice\nquestion: What should change?");
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(1),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let result = fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+
+        let crate::orchestrator::objective::ObjectiveCycleResult::Terminal(result) = result else {
+            panic!("expected terminal budget exhaustion");
+        };
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Blocked
+        );
+        assert_eq!(fixture.ollama.requests().len(), 1);
+        let tickets = fixture.store.list_tickets(None, None).unwrap();
+        assert!(
+            fixture
+                .store
+                .latest_unconsumed_resolution_for_ticket(&tickets[0].id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn objective_monitor_recovers_expired_running_task_before_scheduling() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(1),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        let task = fixture
+            .store
+            .next_ready_objective_task(&objective_id)
+            .unwrap()
+            .unwrap();
+        let owner = "test-expired-worker";
+        fixture.store.acquire_task_lease(&task.id, owner).unwrap();
+        fixture
+            .store
+            .transition_task(&task.id, TaskStatus::Ready, TaskStatus::Running, owner)
+            .unwrap();
+        fixture
+            .store
+            .force_expire_task_lease_for_test(&task.id)
+            .unwrap();
+
+        let result = fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(1),
+                    max_cycles: Some(4),
+                },
+            )
+            .unwrap();
+
+        let crate::orchestrator::objective::ObjectiveCycleResult::Terminal(result) = result else {
+            panic!("expected terminal failed objective");
+        };
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(
+            fixture.store.get_task(&task.id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Failed
+        );
+        assert_eq!(fixture.ollama.requests().len(), 0);
+    }
+
+    #[test]
+    fn objective_validation_passing_completes_objective() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(result.data["exit_reason"], "acceptance_passed");
+        assert_eq!(result.data["validation"]["status"], "passed");
+        assert_eq!(
+            fixture
+                .store
+                .list_active_objective_acceptance_criteria(&objective_id)
+                .unwrap()[0]
+                .status,
+            ObjectiveAcceptanceStatus::Passing
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| event.kind == "objective.validation_passed")
+        );
+    }
+
+    #[test]
+    fn acceptance_repair_task_is_created_once_on_validation_failure() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture.runner.fail_once();
+
+        let cycle = fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            cycle,
+            crate::orchestrator::objective::ObjectiveCycleResult::Progress(_)
+        ));
+        let repair_tasks = fixture
+            .store
+            .list_tasks(None)
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.title.starts_with("Repair objective acceptance:"))
+            .collect::<Vec<_>>();
+        assert_eq!(repair_tasks.len(), 1);
+        let _second = fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        let repair_tasks = fixture
+            .store
+            .list_tasks(None)
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.title.starts_with("Repair objective acceptance:"))
+            .collect::<Vec<_>>();
+        assert_eq!(repair_tasks.len(), 1);
+    }
+
+    #[test]
+    fn acceptance_repair_success_completes_objective() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture.runner.fail_once();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Complete
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_tasks(None)
+                .unwrap()
+                .iter()
+                .filter(|task| task.title.starts_with("Repair objective acceptance:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn objective_validation_unsafe_command_blocks_execution() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .store
+            .force_objective_validation_command_for_test(
+                &objective_id,
+                "rm -rf target",
+                ObjectiveValidationReviewStatus::Trusted,
+            )
+            .unwrap();
+
+        let result = fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Failed);
+        assert_eq!(
+            fixture.store.get_objective(&objective_id).unwrap().status,
+            ObjectiveStatus::Blocked
+        );
+        assert_eq!(fixture.runner.outputs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn objective_validation_failures_use_distinct_artifact_paths() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture.runner.fail_once();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture.runner.fail_once();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        let paths = fixture
+            .store
+            .list_objective_artifacts(&objective_id)
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "objective_validation_failure")
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+    }
+
+    #[test]
+    fn objective_validation_runner_error_persists_failure_event() {
+        let fixture = Fixture::new(1);
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: RuntimeOptions::default(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+        fixture.runner.error_once("runner unavailable");
+
+        fixture
+            .orchestrator
+            .run_one_objective_cycle(
+                &objective_id,
+                &ObjectiveSuperviseOptions {
+                    runtime: RuntimeOptions::default(),
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        let events = fixture.store.list_objective_events(&objective_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "objective.validation_failed"
+                    && event.message.contains("errored"))
+        );
+    }
+
+    #[test]
+    fn objective_validation_uses_runtime_repo_as_command_cwd() {
+        let fixture = Fixture::new(1);
+        let repo = fixture._temp.path().join("alternate-repo");
+        fs::create_dir_all(&repo).unwrap();
+        fixture.openai.push_text(valid_planner_json());
+        fixture.ollama.push_text(diff_response());
+        fixture.ollama.push_text(diff_response());
+        let runtime = RuntimeOptions {
+            repo: Some(repo.clone()),
+            ..RuntimeOptions::default()
+        };
+        let start = fixture
+            .orchestrator
+            .start_objective(ObjectiveStartOptions {
+                runtime: runtime.clone(),
+                prompt: ObjectivePromptInput::Text("Build a Rust CLI".to_string()),
+                supervise: false,
+                planner_model: None,
+                worker_model: None,
+                ticket_model: None,
+                max_worker_attempts: Some(2),
+                max_cycles: None,
+            })
+            .unwrap();
+        let objective_id =
+            ObjectiveId::parse(start.data["objective_id"].as_str().unwrap()).unwrap();
+
+        fixture
+            .orchestrator
+            .supervise_objective(
+                &objective_id,
+                ObjectiveSuperviseOptions {
+                    runtime,
+                    worker_model: None,
+                    ticket_model: None,
+                    max_worker_attempts: Some(2),
+                    max_cycles: Some(8),
+                },
+            )
+            .unwrap();
+
+        let specs = fixture.runner.specs.lock().unwrap();
+        assert_eq!(specs.last().unwrap().cwd, repo.to_string_lossy());
     }
 
     #[test]
@@ -2559,5 +4567,71 @@ mod tests {
 
     fn diff_response() -> &'static str {
         "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n```"
+    }
+
+    fn valid_planner_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "objective": {
+                "title": "Build Rust CLI",
+                "summary": "Create a Rust CLI implementation.",
+                "acceptance_criteria": ["cargo test passes"],
+                "validation_commands": ["cargo test"]
+            },
+            "tasks": [
+                {
+                    "task_key": "inspect_cli",
+                    "title": "Inspect CLI",
+                    "goal": "Understand the CLI command surface.",
+                    "validation": ["cargo test inspect_cli"],
+                    "depends_on": [],
+                    "owned_paths": ["src"],
+                    "parallel_group": "discovery"
+                },
+                {
+                    "task_key": "implement_cli",
+                    "title": "Implement CLI",
+                    "goal": "Implement the Rust CLI.",
+                    "validation": ["cargo test implement_cli"],
+                    "depends_on": ["inspect_cli"],
+                    "owned_paths": ["src"],
+                    "parallel_group": "implementation"
+                }
+            ],
+            "risks": [],
+            "final_verification": ["cargo test"]
+        })
+        .to_string()
+    }
+
+    fn unsafe_validation_planner_json() -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&valid_planner_json()).unwrap();
+        value["tasks"][0]["validation"] = serde_json::json!(["rm -rf target"]);
+        value.to_string()
+    }
+
+    fn valid_resolver_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "diagnosis": "The local worker needs to add the missing command implementation.",
+            "recommended_steps": [
+                "Add the missing command branch using the existing CLI patterns.",
+                "Keep the validation command unchanged and rerun it after the change."
+            ],
+            "constraints": ["Do not change unrelated command behavior."],
+            "validation_focus": ["cargo test inspect_cli"]
+        })
+        .to_string()
+    }
+
+    fn patch_like_resolver_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "diagnosis": "The response must be rejected.",
+            "recommended_steps": ["diff --git a/src/lib.rs b/src/lib.rs"],
+            "constraints": [],
+            "validation_focus": []
+        })
+        .to_string()
     }
 }

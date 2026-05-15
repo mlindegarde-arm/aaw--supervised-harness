@@ -1,0 +1,63 @@
+prompt-contract-v1
+
+Planner output schema:
+{
+  "schema_version": 1,
+  "objective": {
+    "title": "non-empty string",
+    "summary": "non-empty string",
+    "acceptance_criteria": ["non-empty string"],
+    "validation_commands": ["trusted command candidate"]
+  },
+  "tasks": [
+    {
+      "task_key": "lowercase_snake_case",
+      "title": "non-empty string",
+      "goal": "non-empty string",
+      "validation": ["trusted command candidate"],
+      "depends_on": ["other_task_key"],
+      "owned_paths": ["relative/repo/path"],
+      "parallel_group": "non-empty string"
+    }
+  ],
+  "risks": ["string"],
+  "final_verification": ["string"]
+}
+
+Planner request:
+{
+  "schema_version": 1,
+  "objective_prompt": "exit",
+  "repository_context": "----- BEGIN CONTEXT label=objective_prompt original_bytes=4 included_bytes=4 truncated=false -----\nexit\n----- END CONTEXT label=objective_prompt -----\n\n----- BEGIN CONTEXT label=repository original_bytes=51 included_bytes=51 truncated=false -----\nrepo_root: /Users/miklin01/Learning/aaw--supervisor\n----- END CONTEXT label=repository -----",
+  "context_manifest": {
+    "schema_version": 1,
+    "budget": {
+      "total_bytes": 32768,
+      "objective_bytes": 8192,
+      "conversation_bytes": 4096,
+      "state_bytes": 8192,
+      "artifact_excerpt_bytes": 4096,
+      "schema_bytes": 8192
+    },
+    "included_sections": [
+      {
+        "label": "objective_prompt",
+        "budget_class": "objective",
+        "original_bytes": 4,
+        "included_bytes": 4,
+        "truncated": false,
+        "sha256": "e596899f114b5162402325dfb31fdaa792fabed718628336cc7a35a24f38eaa9"
+      },
+      {
+        "label": "repository",
+        "budget_class": "state",
+        "original_bytes": 51,
+        "included_bytes": 51,
+        "truncated": false,
+        "sha256": "af7b6d503a00ba12262953f7584b6cc92acb839977a170f3a262ebb476d2d8ae"
+      }
+    ],
+    "omitted_sections": [],
+    "artifacts": []
+  }
+}

@@ -1,6 +1,8 @@
 pub mod shell;
 
-use crate::domain::{RunId, TaskId, TaskStatus, TicketId, TicketStatus};
+use crate::domain::{
+    ObjectiveId, ObjectiveStatus, RunId, TaskId, TaskStatus, TicketId, TicketStatus,
+};
 use crate::error::HarnessResult;
 use crate::runtime::{
     CommandCatalog, CommandNodeSpec, MetaCommandSpec, OptionSpec, PositionalSpec, StateQueryKind,
@@ -73,6 +75,11 @@ pub trait CompletionStateView {
         &self,
         scope: TicketCompletionScope,
     ) -> HarnessResult<Vec<TicketCompletionItem>>;
+
+    fn objectives_for_completion(
+        &self,
+        scope: ObjectiveCompletionScope,
+    ) -> HarnessResult<Vec<ObjectiveCompletionItem>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +91,11 @@ pub struct TaskCompletionScope {
 pub struct TicketCompletionScope {
     pub statuses: Vec<&'static str>,
     pub task_id: Option<TaskId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveCompletionScope {
+    pub statuses: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +114,13 @@ pub struct TicketCompletionItem {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveCompletionItem {
+    pub id: ObjectiveId,
+    pub status: ObjectiveStatus,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
     Command,
@@ -109,6 +128,7 @@ pub enum CompletionKind {
     Value,
     TaskId,
     TicketId,
+    ObjectiveId,
     MetaCommand,
     Hint,
 }
@@ -421,6 +441,40 @@ impl CompletionEngine {
                     Ok(items) => {
                         let mut dynamic =
                             items.into_iter().map(ticket_candidate).collect::<Vec<_>>();
+                        redact_candidates(&mut dynamic);
+                        self.cache.insert(
+                            key,
+                            CompletionCacheEntry {
+                                candidates: dynamic.clone(),
+                                status: CompletionStatus::Ready,
+                            },
+                        );
+                        candidates.extend(dynamic);
+                        None
+                    }
+                    Err(err) => Some(CompletionStatus::Error(err.to_string())),
+                }
+            }
+            ValueSource::StateQuery(StateQueryKind::ObjectiveId { statuses }) => {
+                let key = CompletionCacheKey {
+                    repo_identity: repo_identity(context.repo.as_ref()),
+                    command_path: analysis.path.clone(),
+                    value_kind: value.kind,
+                    task_scope: None,
+                };
+                if let Some(entry) = self.cache.get(&key) {
+                    candidates.extend(entry.candidates);
+                    return Some(CompletionStatus::Stale);
+                }
+                let scope = ObjectiveCompletionScope {
+                    statuses: statuses.to_vec(),
+                };
+                match context.state.objectives_for_completion(scope) {
+                    Ok(items) => {
+                        let mut dynamic = items
+                            .into_iter()
+                            .map(objective_candidate)
+                            .collect::<Vec<_>>();
                         redact_candidates(&mut dynamic);
                         self.cache.insert(
                             key,
@@ -1203,6 +1257,15 @@ fn ticket_candidate(item: TicketCompletionItem) -> CompletionCandidate {
     }
 }
 
+fn objective_candidate(item: ObjectiveCompletionItem) -> CompletionCandidate {
+    CompletionCandidate {
+        replacement: item.id.to_string(),
+        display: format!("{}  {}  \"{}\"", item.id, item.status.as_str(), item.title),
+        detail: format!("objective {}", item.status.as_str()),
+        kind: CompletionKind::ObjectiveId,
+    }
+}
+
 fn hint_candidate(display: &str, detail: &str) -> CompletionCandidate {
     CompletionCandidate {
         replacement: String::new(),
@@ -1365,13 +1428,16 @@ mod tests {
     const TASK_STUCK: &str = "task_01BRZ3NDEKTSV4RRFFQ69G5FAV";
     const TICKET_OPEN: &str = "ticket_01CRZ3NDEKTSV4RRFFQ69G5FAV";
     const TICKET_OTHER: &str = "ticket_01DRZ3NDEKTSV4RRFFQ69G5FAV";
+    const OBJECTIVE_READY: &str = "objective_01FRZ3NDEKTSV4RRFFQ69G5FAV";
     const RUN_ID: &str = "run_01ERZ3NDEKTSV4RRFFQ69G5FAV";
 
     struct FakeStateView {
         fail_tasks: bool,
         fail_tickets: bool,
+        fail_objectives: bool,
         task_queries: Cell<usize>,
         ticket_queries: Cell<usize>,
+        objective_queries: Cell<usize>,
         last_ticket_scope: std::cell::RefCell<Option<TicketCompletionScope>>,
     }
 
@@ -1380,8 +1446,10 @@ mod tests {
             Self {
                 fail_tasks: false,
                 fail_tickets: false,
+                fail_objectives: false,
                 task_queries: Cell::new(0),
                 ticket_queries: Cell::new(0),
+                objective_queries: Cell::new(0),
                 last_ticket_scope: std::cell::RefCell::new(None),
             }
         }
@@ -1439,6 +1507,21 @@ mod tests {
                     summary: "Resolved".to_string(),
                 },
             ])
+        }
+
+        fn objectives_for_completion(
+            &self,
+            _scope: ObjectiveCompletionScope,
+        ) -> HarnessResult<Vec<ObjectiveCompletionItem>> {
+            self.objective_queries.set(self.objective_queries.get() + 1);
+            if self.fail_objectives {
+                return Err(HarnessError::External("state unavailable".to_string()));
+            }
+            Ok(vec![ObjectiveCompletionItem {
+                id: ObjectiveId::parse(OBJECTIVE_READY).unwrap(),
+                status: ObjectiveStatus::Ready,
+                title: "Build objective CLI".to_string(),
+            }])
         }
     }
 
@@ -1541,6 +1624,52 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.replacement == TICKET_OPEN)
         );
+    }
+
+    #[test]
+    fn completion_dynamic_objective_ids_and_statuses_use_catalog_sources() {
+        let catalog = build_cli();
+        let state = FakeStateView::default();
+        let engine = CompletionEngine::new();
+
+        let statuses = engine
+            .complete(
+                "objective list --status r",
+                25,
+                &test_context(&catalog, &state),
+            )
+            .unwrap();
+        assert_eq!(
+            statuses
+                .candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ready", "running"]
+        );
+
+        for line in [
+            "objective get objective_",
+            "objective plan objective_",
+            "objective supervise objective_",
+            "objective validate objective_",
+            "objective cancel objective_",
+        ] {
+            let set = engine
+                .complete(line, line.len(), &test_context(&catalog, &state))
+                .unwrap();
+            assert!(
+                set.candidates
+                    .iter()
+                    .all(|candidate| candidate.kind == CompletionKind::ObjectiveId)
+            );
+            assert!(
+                set.candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == OBJECTIVE_READY)
+            );
+        }
+        assert_eq!(state.objective_queries.get(), 5);
     }
 
     #[test]

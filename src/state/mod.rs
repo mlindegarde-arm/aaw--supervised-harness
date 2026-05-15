@@ -1,8 +1,13 @@
+pub mod objective_queries;
 pub mod supervisor_queries;
 
 use crate::domain::{
-    Artifact, Attempt, AttemptId, Event, Run, RunId, RunStatus, Task, TaskId, TaskStatus,
-    TaskValidationCommand, Ticket, TicketId, TicketResolution, TicketResolutionId, TicketStatus,
+    Artifact, Attempt, AttemptId, Event, ObjectiveAcceptanceCriterionId, ObjectiveAcceptanceStatus,
+    ObjectiveArtifactId, ObjectiveEventId, ObjectiveId, ObjectiveMessageId, ObjectivePlanId,
+    ObjectiveResolverAttemptId, ObjectiveStatus, ObjectiveValidationCommandId,
+    ObjectiveValidationCommandSource, ObjectiveValidationReviewStatus, PlannerExchangeId,
+    PlannerExchangeKind, Run, RunId, RunStatus, Task, TaskId, TaskStatus, TaskValidationCommand,
+    Ticket, TicketId, TicketResolution, TicketResolutionId, TicketStatus,
 };
 use crate::service::SupervisorStateStore;
 use crate::{HarnessError, HarnessResult};
@@ -40,7 +45,366 @@ pub struct RunUpdate {
     pub last_error: Option<String>,
 }
 
-pub trait TaskStore: SupervisorStateStore {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Objective {
+    pub id: ObjectiveId,
+    pub title: String,
+    pub prompt: String,
+    pub summary: String,
+    pub status: ObjectiveStatus,
+    pub planner_model: Option<String>,
+    pub worker_model: Option<String>,
+    pub ticket_model: Option<String>,
+    pub active_plan_id: Option<ObjectivePlanId>,
+    pub monitor_lease_owner: Option<String>,
+    pub monitor_lease_expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectivePlan {
+    pub id: ObjectivePlanId,
+    pub objective_id: ObjectiveId,
+    pub version: u32,
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveAcceptanceCriterion {
+    pub id: ObjectiveAcceptanceCriterionId,
+    pub objective_id: ObjectiveId,
+    pub plan_id: ObjectivePlanId,
+    pub description: String,
+    pub status: ObjectiveAcceptanceStatus,
+    pub last_evaluated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveValidationCommand {
+    pub id: ObjectiveValidationCommandId,
+    pub objective_id: ObjectiveId,
+    pub plan_id: ObjectivePlanId,
+    pub command: String,
+    pub source: ObjectiveValidationCommandSource,
+    pub review_status: ObjectiveValidationReviewStatus,
+    pub review_reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveArtifact {
+    pub id: ObjectiveArtifactId,
+    pub objective_id: ObjectiveId,
+    pub plan_id: Option<ObjectivePlanId>,
+    pub planner_exchange_id: Option<PlannerExchangeId>,
+    pub kind: String,
+    pub path: String,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerExchange {
+    pub id: PlannerExchangeId,
+    pub objective_id: ObjectiveId,
+    pub kind: PlannerExchangeKind,
+    pub ticket_id: Option<TicketId>,
+    pub model: String,
+    pub system_prompt_version: String,
+    pub request_objective_artifact_id: Option<ObjectiveArtifactId>,
+    pub response_objective_artifact_id: Option<ObjectiveArtifactId>,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewObjectiveMessage {
+    pub id: ObjectiveMessageId,
+    pub objective_id: ObjectiveId,
+    pub role: String,
+    pub kind: String,
+    pub content_objective_artifact_id: Option<ObjectiveArtifactId>,
+    pub content_preview: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveMessage {
+    pub id: ObjectiveMessageId,
+    pub objective_id: ObjectiveId,
+    pub sequence: u32,
+    pub role: String,
+    pub kind: String,
+    pub content_objective_artifact_id: Option<ObjectiveArtifactId>,
+    pub content_preview: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveEvent {
+    pub id: ObjectiveEventId,
+    pub objective_id: ObjectiveId,
+    pub event_type: String,
+    pub message: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveTask {
+    pub objective_id: ObjectiveId,
+    pub task_id: TaskId,
+    pub plan_id: ObjectivePlanId,
+    pub task_key: String,
+    pub parallel_group: Option<String>,
+    pub owned_paths_json: String,
+    pub sequence: u32,
+    pub worker_attempt_budget: u32,
+    pub worker_attempts_used: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveTaskDependency {
+    pub objective_id: ObjectiveId,
+    pub task_id: TaskId,
+    pub depends_on_task_id: TaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveTaskValidationCommand {
+    pub id: ObjectiveValidationCommandId,
+    pub objective_id: ObjectiveId,
+    pub task_id: TaskId,
+    pub command: String,
+    pub review_status: ObjectiveValidationReviewStatus,
+    pub review_reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectiveTaskStatusCounts {
+    pub total: u32,
+    pub ready: u32,
+    pub running: u32,
+    pub stuck: u32,
+    pub complete: u32,
+    pub failed: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewGeneratedTask {
+    pub task: Task,
+    pub task_key: String,
+    pub parallel_group: Option<String>,
+    pub owned_paths_json: String,
+    pub sequence: u32,
+    pub worker_attempt_budget: u32,
+    pub trusted_validation_commands: Vec<String>,
+    pub reviewed_validation_commands: Vec<ObjectiveTaskValidationCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewObjectiveTaskDependency {
+    pub task_id: TaskId,
+    pub depends_on_task_id: TaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectivePlanBundle {
+    pub objective_updated_at: String,
+    pub plan: ObjectivePlan,
+    pub acceptance_criteria: Vec<ObjectiveAcceptanceCriterion>,
+    pub validation_commands: Vec<ObjectiveValidationCommand>,
+    pub generated_tasks: Vec<NewGeneratedTask>,
+    pub dependencies: Vec<NewObjectiveTaskDependency>,
+    pub artifacts: Vec<ObjectiveArtifact>,
+    pub exchange: PlannerExchange,
+    pub messages: Vec<NewObjectiveMessage>,
+    pub events: Vec<ObjectiveEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectivePlanBundleResult {
+    pub objective: Objective,
+    pub plan: ObjectivePlan,
+    pub tasks: Vec<ObjectiveTask>,
+    pub messages: Vec<ObjectiveMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedPlannerExchange {
+    pub artifacts: Vec<ObjectiveArtifact>,
+    pub exchange: PlannerExchange,
+    pub messages: Vec<NewObjectiveMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveResolverAttempt {
+    pub id: ObjectiveResolverAttemptId,
+    pub objective_id: ObjectiveId,
+    pub ticket_id: TicketId,
+    pub attempt: u32,
+    pub status: String,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub planner_exchange_id: Option<PlannerExchangeId>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewObjectiveResolverAttempt {
+    pub id: ObjectiveResolverAttemptId,
+    pub objective_id: ObjectiveId,
+    pub ticket_id: TicketId,
+    pub attempt: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveMonitorLease {
+    pub objective_id: ObjectiveId,
+    pub owner: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjectiveStatusUpdate {
+    pub status: Option<ObjectiveStatus>,
+    pub summary: Option<String>,
+    pub active_plan_id: Option<Option<ObjectivePlanId>>,
+    pub updated_at: Option<String>,
+}
+
+pub trait ObjectiveStore {
+    fn insert_objective(&self, objective: Objective) -> HarnessResult<()>;
+    fn get_objective(&self, objective_id: &ObjectiveId) -> HarnessResult<Objective>;
+    fn list_objectives(&self, status: Option<ObjectiveStatus>) -> HarnessResult<Vec<Objective>>;
+    fn update_objective_status(
+        &self,
+        objective_id: &ObjectiveId,
+        expected: Option<ObjectiveStatus>,
+        update: ObjectiveStatusUpdate,
+    ) -> HarnessResult<Objective>;
+    fn insert_objective_artifact(&self, artifact: ObjectiveArtifact) -> HarnessResult<()>;
+    fn list_objective_artifacts(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<ObjectiveArtifact>>;
+    fn insert_objective_message(
+        &self,
+        message: NewObjectiveMessage,
+    ) -> HarnessResult<ObjectiveMessage>;
+    fn list_objective_messages(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<ObjectiveMessage>>;
+    fn insert_objective_event(&self, event: ObjectiveEvent) -> HarnessResult<()>;
+    fn list_objective_events(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<ObjectiveEvent>>;
+    fn insert_planner_exchange(&self, exchange: PlannerExchange) -> HarnessResult<()>;
+    fn list_planner_exchanges(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<PlannerExchange>>;
+    fn reject_objective_plan(
+        &self,
+        objective_id: &ObjectiveId,
+        exchange: RejectedPlannerExchange,
+        event: ObjectiveEvent,
+    ) -> HarnessResult<()>;
+    fn create_objective_plan_bundle(
+        &self,
+        objective_id: &ObjectiveId,
+        bundle: ObjectivePlanBundle,
+    ) -> HarnessResult<ObjectivePlanBundleResult>;
+    fn next_ready_objective_task(&self, objective_id: &ObjectiveId) -> HarnessResult<Option<Task>>;
+    fn next_stuck_objective_task(&self, objective_id: &ObjectiveId) -> HarnessResult<Option<Task>>;
+    fn get_objective_task(
+        &self,
+        objective_id: &ObjectiveId,
+        task_id: &TaskId,
+    ) -> HarnessResult<ObjectiveTask>;
+    fn list_active_objective_task_ids(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<TaskId>>;
+    fn increment_objective_task_attempts_used(
+        &self,
+        objective_id: &ObjectiveId,
+        task_id: &TaskId,
+        delta: u32,
+    ) -> HarnessResult<ObjectiveTask>;
+    fn active_objective_task_status_counts(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<ObjectiveTaskStatusCounts>;
+    fn list_active_objective_acceptance_criteria(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<ObjectiveAcceptanceCriterion>>;
+    fn list_active_objective_validation_commands(
+        &self,
+        objective_id: &ObjectiveId,
+    ) -> HarnessResult<Vec<ObjectiveValidationCommand>>;
+    fn update_active_objective_acceptance_status(
+        &self,
+        objective_id: &ObjectiveId,
+        status: ObjectiveAcceptanceStatus,
+        evaluated_at: &str,
+    ) -> HarnessResult<()>;
+    fn create_objective_repair_task(
+        &self,
+        objective_id: &ObjectiveId,
+        generated: NewGeneratedTask,
+    ) -> HarnessResult<ObjectiveTask>;
+    fn create_resolver_attempt(
+        &self,
+        attempt: NewObjectiveResolverAttempt,
+    ) -> HarnessResult<ObjectiveResolverAttempt>;
+    fn list_resolver_attempts_for_ticket(
+        &self,
+        objective_id: &ObjectiveId,
+        ticket_id: &TicketId,
+    ) -> HarnessResult<Vec<ObjectiveResolverAttempt>>;
+    fn acquire_resolver_attempt_lease(
+        &self,
+        attempt_id: &ObjectiveResolverAttemptId,
+        owner: &str,
+    ) -> HarnessResult<ObjectiveResolverAttempt>;
+    fn release_resolver_attempt_lease(
+        &self,
+        attempt_id: &ObjectiveResolverAttemptId,
+        owner: &str,
+        status: &str,
+        planner_exchange_id: Option<&PlannerExchangeId>,
+        last_error: Option<&str>,
+    ) -> HarnessResult<ObjectiveResolverAttempt>;
+    fn acquire_objective_monitor_lease(
+        &self,
+        objective_id: &ObjectiveId,
+        owner: &str,
+    ) -> HarnessResult<ObjectiveMonitorLease>;
+    fn refresh_objective_monitor_lease(
+        &self,
+        objective_id: &ObjectiveId,
+        owner: &str,
+    ) -> HarnessResult<ObjectiveMonitorLease>;
+    fn release_objective_monitor_lease(
+        &self,
+        objective_id: &ObjectiveId,
+        owner: &str,
+    ) -> HarnessResult<()>;
+}
+
+pub trait TaskStore: SupervisorStateStore + ObjectiveStore {
     fn insert_task(&self, task: Task, validation_commands: Vec<String>) -> HarnessResult<()>;
     fn list_tasks(&self, status: Option<TaskStatus>) -> HarnessResult<Vec<Task>>;
     fn get_task(&self, task_id: &TaskId) -> HarnessResult<Task>;
@@ -124,10 +488,11 @@ pub trait TaskStore: SupervisorStateStore {
 
 const DEFAULT_LEASE_TTL_SECS: i64 = 300;
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_state_store",
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_state_store",
+        sql: r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -257,7 +622,169 @@ CREATE INDEX idx_tickets_task_status ON tickets(task_id, status);
 CREATE INDEX idx_ticket_resolutions_ticket_created_at ON ticket_resolutions(ticket_id, created_at);
 CREATE INDEX idx_events_task_created_at ON events(task_id, created_at);
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "objective_state",
+        sql: r#"
+CREATE TABLE objectives (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('planning','ready','running','blocked','complete','failed','cancelled')),
+    planner_model TEXT,
+    worker_model TEXT,
+    ticket_model TEXT,
+    active_plan_id TEXT REFERENCES objective_plans(id),
+    monitor_lease_owner TEXT,
+    monitor_lease_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE objective_plans (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(objective_id, version)
+);
+
+CREATE TABLE objective_acceptance_criteria (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES objective_plans(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','passing','failing','waived')),
+    last_evaluated_at TEXT
+);
+
+CREATE TABLE objective_validation_commands (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES objective_plans(id) ON DELETE CASCADE,
+    command TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('planner','user','system')),
+    review_status TEXT NOT NULL CHECK (review_status IN ('trusted','needs_review','rejected')),
+    review_reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_objectives_status_created ON objectives(status, created_at);
+CREATE INDEX idx_objective_plans_objective_version ON objective_plans(objective_id, version);
+CREATE INDEX idx_objective_acceptance_objective_plan ON objective_acceptance_criteria(objective_id, plan_id);
+CREATE INDEX idx_objective_validations_objective_plan ON objective_validation_commands(objective_id, plan_id);
+"#,
+    },
+    Migration {
+        version: 3,
+        name: "objective_transactions_artifacts_scheduling",
+        sql: r#"
+CREATE TABLE objective_tasks (
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES objective_plans(id) ON DELETE CASCADE,
+    task_key TEXT NOT NULL,
+    parallel_group TEXT,
+    owned_paths_json TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    worker_attempt_budget INTEGER NOT NULL,
+    worker_attempts_used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (objective_id, task_id),
+    UNIQUE(objective_id, task_key)
+);
+
+CREATE TABLE objective_task_dependencies (
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (objective_id, task_id, depends_on_task_id)
+);
+
+CREATE TABLE objective_task_validation_commands (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    command TEXT NOT NULL,
+    review_status TEXT NOT NULL CHECK (review_status IN ('trusted','needs_review','rejected')),
+    review_reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE objective_events (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE objective_artifacts (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    plan_id TEXT REFERENCES objective_plans(id) ON DELETE CASCADE,
+    planner_exchange_id TEXT,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    byte_len INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE planner_exchanges (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('initial_plan','ticket_resolution')),
+    ticket_id TEXT REFERENCES tickets(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    system_prompt_version TEXT NOT NULL,
+    request_objective_artifact_id TEXT REFERENCES objective_artifacts(id),
+    response_objective_artifact_id TEXT REFERENCES objective_artifacts(id),
+    status TEXT NOT NULL CHECK (status IN ('running','accepted','rejected','failed')),
+    error TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE objective_messages (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user','system','planner','resolver','harness')),
+    kind TEXT NOT NULL,
+    content_objective_artifact_id TEXT REFERENCES objective_artifacts(id),
+    content_preview TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(objective_id, sequence)
+);
+
+CREATE TABLE objective_ticket_resolver_attempts (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued','resolving','resolved','failed')),
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    planner_exchange_id TEXT REFERENCES planner_exchanges(id),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(objective_id, ticket_id, attempt)
+);
+
+CREATE INDEX idx_objective_tasks_objective_sequence ON objective_tasks(objective_id, sequence);
+CREATE INDEX idx_objective_tasks_task ON objective_tasks(task_id);
+CREATE INDEX idx_objective_task_deps_dep ON objective_task_dependencies(depends_on_task_id);
+CREATE INDEX idx_objective_events_objective_created ON objective_events(objective_id, created_at);
+CREATE INDEX idx_planner_exchanges_objective_created ON planner_exchanges(objective_id, created_at);
+CREATE INDEX idx_objective_artifacts_objective_created ON objective_artifacts(objective_id, created_at);
+CREATE INDEX idx_objective_ticket_resolver_ticket ON objective_ticket_resolver_attempts(ticket_id, status);
+"#,
+    },
+];
 
 #[derive(Debug, Clone, Copy)]
 struct Migration {
@@ -318,6 +845,35 @@ impl SqliteTaskStore {
         self.conn
             .lock()
             .map_err(|_| HarnessError::External("sqlite connection lock poisoned".to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_expire_task_lease_for_test(&self, task_id: &TaskId) -> HarnessResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE tasks SET lease_expires_at = '0' WHERE id = ?1",
+            params![task_id.as_str()],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_objective_validation_command_for_test(
+        &self,
+        objective_id: &ObjectiveId,
+        command: &str,
+        review_status: ObjectiveValidationReviewStatus,
+    ) -> HarnessResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE objective_validation_commands
+             SET command = ?2, review_status = ?3
+             WHERE objective_id = ?1",
+            params![objective_id.as_str(), command, review_status.as_str()],
+        )
+        .map_err(sql_err)?;
+        Ok(())
     }
 }
 
@@ -1754,8 +2310,157 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migration_count, 1);
+        assert_eq!(migration_count, 3);
         assert_eq!(task_columns, 18);
+    }
+
+    #[test]
+    fn objective_migration_fresh_database_applies_version_2() {
+        let store = SqliteTaskStore::in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+
+        let migration_name: String = conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let objective_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objectives')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let plan_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objective_plans')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let acceptance_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objective_acceptance_criteria')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let validation_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objective_validation_commands')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let objective_index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_objectives_status_created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let b2_migration_name: String = conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let objective_task_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objective_tasks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let resolver_attempt_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('objective_ticket_resolver_attempts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(migration_name, "objective_state");
+        assert_eq!(objective_columns, 13);
+        assert_eq!(plan_columns, 5);
+        assert_eq!(acceptance_columns, 6);
+        assert_eq!(validation_columns, 8);
+        assert_eq!(objective_index_count, 1);
+        assert_eq!(
+            b2_migration_name,
+            "objective_transactions_artifacts_scheduling"
+        );
+        assert_eq!(objective_task_columns, 9);
+        assert_eq!(resolver_attempt_columns, 11);
+    }
+
+    #[test]
+    fn objective_migration_existing_version_1_database_upgrades_to_2() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at, checksum)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    MIGRATIONS[0].version,
+                    MIGRATIONS[0].name,
+                    "2026-01-01T00:00:00Z",
+                    checksum(MIGRATIONS[0].sql),
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteTaskStore::open(&db_path).unwrap();
+        let conn = store.lock_conn().unwrap();
+        let migrations: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let task_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let objective_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'objectives'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            migrations,
+            vec![
+                (1, "initial_state_store".to_string()),
+                (2, "objective_state".to_string()),
+                (3, "objective_transactions_artifacts_scheduling".to_string()),
+            ]
+        );
+        assert_eq!(task_columns, 18);
+        assert_eq!(objective_count, 1);
+    }
+
+    #[test]
+    fn objective_migration_1_checksum_is_unchanged() {
+        assert_eq!(MIGRATIONS[0].version, 1);
+        assert_eq!(MIGRATIONS[0].name, "initial_state_store");
+        assert_eq!(checksum(MIGRATIONS[0].sql), "d168a1a4f4e02034");
     }
 
     #[test]

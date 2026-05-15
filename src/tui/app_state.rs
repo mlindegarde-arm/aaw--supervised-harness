@@ -1,6 +1,6 @@
-use crate::runtime::{PaneStateSnapshot, TranscriptEvent, TuiRuntimeEvent};
+use crate::runtime::{CommandEvent, PaneStateSnapshot, TranscriptEvent, TuiRuntimeEvent};
 use crate::tui::composer::SuggestionRow;
-use crate::tui::panes::SidePaneState;
+use crate::tui::panes::{DashboardPaneSnapshot, SidePaneState};
 use crate::tui::transcript::TranscriptState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +137,19 @@ impl TuiAppState {
         self.panes.set_snapshot(snapshot);
     }
 
+    pub fn set_dashboard_snapshot(&mut self, snapshot: DashboardPaneSnapshot) {
+        self.header.open_tickets = match &snapshot.phase2.tickets {
+            crate::runtime::PaneSection::Ready(rows) => rows
+                .iter()
+                .filter(|row| row.status == crate::domain::TicketStatus::Open)
+                .count(),
+            crate::runtime::PaneSection::Loading | crate::runtime::PaneSection::Error(_) => {
+                self.header.open_tickets
+            }
+        };
+        self.panes.set_dashboard_snapshot(snapshot);
+    }
+
     pub fn set_activity(&mut self, activity: CommandActivity) {
         self.activity = activity;
         self.composer.disabled = activity != CommandActivity::Idle;
@@ -163,11 +176,13 @@ impl TuiAppState {
                 self.append_transcript_event(TranscriptEvent::SuperviseProgress(progress));
             }
             TuiRuntimeEvent::CommandEvent(event) => {
+                self.apply_command_event(&event);
                 self.append_transcript_event(TranscriptEvent::Command(event));
             }
             TuiRuntimeEvent::CommandFinished(result) => {
                 self.set_activity(CommandActivity::Idle);
                 for event in result.events {
+                    self.apply_command_event(&event);
                     self.append_transcript_event(TranscriptEvent::Command(event));
                 }
                 self.append_transcript_event(TranscriptEvent::CommandFinished(result.exit));
@@ -185,6 +200,14 @@ impl TuiAppState {
                 self.append_transcript_event(TranscriptEvent::Error(message));
                 self.panes.mark_stale();
             }
+        }
+    }
+
+    fn apply_command_event(&mut self, event: &CommandEvent) {
+        if let Some(progress) = &event.objective_progress {
+            self.header.phase = progress.phase.as_str().to_string();
+            self.header.active_task = progress.task_id.as_ref().map(ToString::to_string);
+            self.panes.apply_objective_progress(progress);
         }
     }
 

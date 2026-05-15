@@ -1,6 +1,9 @@
-use crate::domain::{ArtifactId, RunId, RunStatus, TaskId, TaskStatus, TicketId, TicketStatus};
+use crate::domain::{
+    ArtifactId, ObjectiveId, ObjectiveStatus, RunId, RunStatus, TaskId, TaskStatus, TicketId,
+    TicketStatus,
+};
 
-use super::{CommandEvent, CommandExit, CommandResult};
+use super::{CommandEvent, CommandEventLevel, CommandExit, CommandResult};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +75,172 @@ impl SuperviseProgressEvent {
             "elapsed_ms": 0,
             "next_command": self.next_command,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectiveProgressKind {
+    PlanningStarted,
+    PlanningCompleted,
+    PlanRejected,
+    TaskCreated,
+    SupervisionStarted,
+    WorkerStarted,
+    WorkerCompleted,
+    TicketDetected,
+    TicketResolutionStarted,
+    TicketResolutionCompleted,
+    WorkerResumed,
+    ValidationStarted,
+    ValidationFailed,
+    RepairTaskCreated,
+    ValidationPassed,
+    Completed,
+    Blocked,
+    Failed,
+    CancelRequested,
+    Cancelled,
+}
+
+impl ObjectiveProgressKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanningStarted => "objective.planning_started",
+            Self::PlanningCompleted => "objective.planning_completed",
+            Self::PlanRejected => "objective.plan_rejected",
+            Self::TaskCreated => "objective.task_created",
+            Self::SupervisionStarted => "objective.supervision_started",
+            Self::WorkerStarted => "objective.worker_started",
+            Self::WorkerCompleted => "objective.worker_completed",
+            Self::TicketDetected => "objective.ticket_detected",
+            Self::TicketResolutionStarted => "objective.ticket_resolution_started",
+            Self::TicketResolutionCompleted => "objective.ticket_resolution_completed",
+            Self::WorkerResumed => "objective.worker_resumed",
+            Self::ValidationStarted => "objective.validation_started",
+            Self::ValidationFailed => "objective.validation_failed",
+            Self::RepairTaskCreated => "objective.repair_task_created",
+            Self::ValidationPassed => "objective.validation_passed",
+            Self::Completed => "objective.completed",
+            Self::Blocked => "objective.blocked",
+            Self::Failed => "objective.failed",
+            Self::CancelRequested => "objective.cancel_requested",
+            Self::Cancelled => "objective.cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectiveProgressPhase {
+    Planning,
+    Ready,
+    Running,
+    Resolving,
+    Validating,
+    Blocked,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl ObjectiveProgressPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Resolving => "resolving",
+            Self::Validating => "validating",
+            Self::Blocked => "blocked",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectiveProgressEvent {
+    pub kind: ObjectiveProgressKind,
+    pub objective_id: ObjectiveId,
+    pub task_id: Option<TaskId>,
+    pub ticket_id: Option<TicketId>,
+    pub phase: ObjectiveProgressPhase,
+    pub status: ObjectiveStatus,
+    pub message: String,
+    pub timestamp: String,
+    pub next_command: Option<String>,
+    pub payload: Value,
+}
+
+impl ObjectiveProgressEvent {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(
+        kind: ObjectiveProgressKind,
+        objective_id: ObjectiveId,
+        phase: ObjectiveProgressPhase,
+        status: ObjectiveStatus,
+        message: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            objective_id,
+            task_id: None,
+            ticket_id: None,
+            phase,
+            status,
+            message: message.into(),
+            timestamp: timestamp.into(),
+            next_command: None,
+            payload: json!({}),
+        }
+    }
+
+    pub fn to_json(&self, level: CommandEventLevel) -> Value {
+        json!({
+            "event": self.kind.as_str(),
+            "schema_version": Self::SCHEMA_VERSION,
+            "level": level.as_str(),
+            "objective_id": self.objective_id.as_str(),
+            "task_id": self.task_id.as_ref().map(TaskId::as_str),
+            "ticket_id": self.ticket_id.as_ref().map(TicketId::as_str),
+            "phase": self.phase.as_str(),
+            "status": self.status.as_str(),
+            "message": self.message,
+            "timestamp": self.timestamp,
+            "next_command": self.next_command,
+            "payload": self.payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandEventEnvelope {
+    Supervise {
+        level: CommandEventLevel,
+        progress: SuperviseProgressEvent,
+    },
+    Objective {
+        level: CommandEventLevel,
+        progress: ObjectiveProgressEvent,
+    },
+}
+
+impl CommandEventEnvelope {
+    pub fn objective(level: CommandEventLevel, progress: ObjectiveProgressEvent) -> Self {
+        Self::Objective { level, progress }
+    }
+
+    pub fn supervise(level: CommandEventLevel, progress: SuperviseProgressEvent) -> Self {
+        Self::Supervise { level, progress }
+    }
+
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Supervise { progress, .. } => progress.to_json(),
+            Self::Objective { level, progress } => progress.to_json(*level),
+        }
     }
 }
 
@@ -215,5 +384,72 @@ mod tests {
         let transcript = TranscriptEvent::SuperviseProgress(progress.clone());
 
         assert_eq!(transcript, TranscriptEvent::SuperviseProgress(progress));
+    }
+
+    #[test]
+    fn objective_progress_event_serializes_as_stable_envelope() {
+        let mut progress = ObjectiveProgressEvent::new(
+            ObjectiveProgressKind::WorkerStarted,
+            ObjectiveId::parse("objective_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+            "running generated task",
+            "2026-05-14T12:00:00Z",
+        );
+        progress.task_id = Some(TaskId::parse(TASK_ID).unwrap());
+        progress.next_command = Some(
+            "harness objective get objective_01ARZ3NDEKTSV4RRFFQ69G5FAV --output json".to_string(),
+        );
+
+        assert_eq!(
+            progress.to_json(CommandEventLevel::Info),
+            json!({
+                "event": "objective.worker_started",
+                "schema_version": 1,
+                "level": "info",
+                "objective_id": "objective_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "task_id": TASK_ID,
+                "ticket_id": null,
+                "phase": "running",
+                "status": "running",
+                "message": "running generated task",
+                "timestamp": "2026-05-14T12:00:00Z",
+                "next_command": "harness objective get objective_01ARZ3NDEKTSV4RRFFQ69G5FAV --output json",
+                "payload": {},
+            })
+        );
+    }
+
+    #[test]
+    fn command_event_envelope_serializes_objective_progress() {
+        let progress = ObjectiveProgressEvent::new(
+            ObjectiveProgressKind::PlanningCompleted,
+            ObjectiveId::parse("objective_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            ObjectiveProgressPhase::Ready,
+            ObjectiveStatus::Ready,
+            "objective plan accepted",
+            "2026-05-14T12:00:00Z",
+        );
+        let envelope = CommandEventEnvelope::objective(CommandEventLevel::Info, progress);
+
+        assert_eq!(envelope.to_json()["event"], "objective.planning_completed");
+        assert_eq!(envelope.to_json()["schema_version"], 1);
+        assert_eq!(envelope.to_json()["phase"], "ready");
+    }
+
+    #[test]
+    fn objective_progress_contract_covers_visible_phases_and_terminal_failure() {
+        assert_eq!(ObjectiveProgressPhase::Resolving.as_str(), "resolving");
+        assert_eq!(ObjectiveProgressPhase::Validating.as_str(), "validating");
+        assert_eq!(ObjectiveProgressKind::Failed.as_str(), "objective.failed");
+    }
+
+    #[test]
+    fn command_event_envelope_preserves_supervise_progress_json() {
+        let progress = SuperviseProgressEvent::new(SuperviseProgressPhase::RunTask, "running task");
+        let direct = progress.to_json();
+        let envelope = CommandEventEnvelope::supervise(CommandEventLevel::Info, progress);
+
+        assert_eq!(envelope.to_json(), direct);
     }
 }

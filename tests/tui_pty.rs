@@ -87,7 +87,7 @@ fn invalid_command_recovers_and_shell_env_is_sanitized() {
         .unwrap();
     tui.wait_for_text("Composer", SHORT).unwrap();
 
-    tui.type_text("task nope").unwrap();
+    tui.type_text("/task nope").unwrap();
     tui.press_enter().unwrap();
     let screen = tui
         .wait_for_text("Choose a task subcommand", SHORT)
@@ -155,11 +155,33 @@ fn task_tab_renders_subcommand_suggestions() {
         .unwrap();
     tui.wait_for_text("Composer", SHORT).unwrap();
 
-    tui.type_text("task ").unwrap();
+    tui.type_text("/task ").unwrap();
     tui.press_tab().unwrap();
     let screen = tui.wait_for_text("Create a task", SHORT).unwrap();
     assert!(screen.text.contains("List tasks"), "{}", screen.text);
     assert!(screen.text.contains("Run a task once"), "{}", screen.text);
+
+    tui.press_ctrl_u().unwrap();
+    tui.press_ctrl_d().unwrap();
+    assert_terminal_cleanup(&tui.wait_for_exit(SHORT).unwrap());
+}
+
+#[test]
+fn plain_task_list_renders_prompt_first_compatibility_warning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    BinaryHarness::new().init_repo_json(&fixture.path);
+
+    let mut tui = harness_pty(&fixture.path, WIDE)
+        .spawn([] as [&str; 0])
+        .unwrap();
+    tui.wait_for_text("Composer", SHORT).unwrap();
+
+    tui.type_text("task list").unwrap();
+    let screen = tui
+        .wait_for_text("Use /task to run harness commands", SHORT)
+        .unwrap();
+    assert!(screen.text.contains("> task list"), "{}", screen.text);
 
     tui.press_ctrl_u().unwrap();
     tui.press_ctrl_d().unwrap();
@@ -180,11 +202,88 @@ fn seeded_resume_task_id_completion_renders_status_and_title_context() {
         .unwrap();
     tui.wait_for_text("Composer", SHORT).unwrap();
 
-    tui.type_text("resume task_").unwrap();
+    tui.type_text("/resume task_").unwrap();
     tui.press_tab().unwrap();
     let screen = tui.wait_for_text("TUI PTY completion", SHORT).unwrap();
     assert!(screen.text.contains("task_"), "{}", screen.text);
     assert!(screen.text.contains("ready"), "{}", screen.text);
+
+    tui.press_ctrl_u().unwrap();
+    tui.press_ctrl_d().unwrap();
+    assert_terminal_cleanup(&tui.wait_for_exit(SHORT).unwrap());
+}
+
+#[test]
+fn seeded_ticket_id_completion_renders_status_and_question_context() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let ticket_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        ["STUCK\nreason: need guidance\nquestion: Which TUI PTY ticket path should be used?"],
+    );
+    let openai = FakeOpenAiServer::scripted(ticket_model, [("resp_ticket_unused", "unused")]);
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let task_id = create_task(
+        &binary,
+        "TUI PTY ticket completion",
+        &cargo_validation_command(),
+    );
+    let ticket_id = create_stuck_ticket(&binary, &task_id, local_model);
+
+    let mut tui = harness_pty(&fixture.path, WIDE)
+        .spawn([] as [&str; 0])
+        .unwrap();
+    tui.wait_for_text("Composer", SHORT).unwrap();
+
+    tui.type_text("/ticket get ticket_").unwrap();
+    tui.press_tab().unwrap();
+    let screen = tui.wait_for_text(&ticket_id, SHORT).unwrap();
+    assert!(screen.text.contains("ticket_"), "{}", screen.text);
+    assert!(screen.text.contains("open"), "{}", screen.text);
+    assert!(screen.text.contains(&ticket_id), "{}", screen.text);
+
+    tui.press_ctrl_u().unwrap();
+    tui.press_ctrl_d().unwrap();
+    assert_terminal_cleanup(&tui.wait_for_exit(SHORT).unwrap());
+}
+
+#[test]
+fn seeded_objective_id_completion_renders_status_and_title_context() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let planner_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        planner_model,
+        [("resp_objective_completion_plan", objective_planner_json())],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+    let objective_id = create_objective(&binary);
+
+    let mut tui = harness_pty(&fixture.path, WIDE)
+        .spawn([] as [&str; 0])
+        .unwrap();
+    tui.wait_for_text("Composer", SHORT).unwrap();
+
+    tui.type_text("/objective get objective_").unwrap();
+    tui.press_tab().unwrap();
+    let screen = tui.wait_for_text(&objective_id, SHORT).unwrap();
+    assert!(screen.text.contains("objective_"), "{}", screen.text);
+    assert!(screen.text.contains("ready"), "{}", screen.text);
+    assert!(screen.text.contains(&objective_id), "{}", screen.text);
 
     tui.press_ctrl_u().unwrap();
     tui.press_ctrl_d().unwrap();
@@ -202,22 +301,22 @@ fn down_enter_and_tab_insert_selected_suggestions() {
         .unwrap();
     tui.wait_for_text("Composer", SHORT).unwrap();
 
-    tui.type_text("task ").unwrap();
+    tui.type_text("/task ").unwrap();
     tui.wait_for_text("Create a task", SHORT).unwrap();
     tui.press_down().unwrap();
     tui.press_enter().unwrap();
-    let screen = tui.wait_for_text("> task cleanup", SHORT).unwrap();
-    assert!(screen.text.contains("> task cleanup"), "{}", screen.text);
+    let screen = tui.wait_for_text("> /task cleanup", SHORT).unwrap();
+    assert!(screen.text.contains("> /task cleanup"), "{}", screen.text);
 
     tui.press_ctrl_u().unwrap();
-    tui.wait_for_absence("> task cleanup", SHORT).unwrap();
-    tui.type_text("task ").unwrap();
+    tui.wait_for_absence("> /task cleanup", SHORT).unwrap();
+    tui.type_text("/task ").unwrap();
     tui.wait_for_text("Create a task", SHORT).unwrap();
     tui.press_down().unwrap();
     tui.press_down().unwrap();
     tui.press_tab().unwrap();
-    let screen = tui.wait_for_text("> task create", SHORT).unwrap();
-    assert!(screen.text.contains("> task create"), "{}", screen.text);
+    let screen = tui.wait_for_text("> /task create", SHORT).unwrap();
+    assert!(screen.text.contains("> /task create"), "{}", screen.text);
 
     tui.press_ctrl_u().unwrap();
     tui.press_ctrl_d().unwrap();
@@ -235,7 +334,7 @@ fn foreground_supervise_streams_progress_and_reenables_composer() {
     let task_id = seeded_task(&fixture.path, &ollama, &openai);
 
     let command =
-        format!("supervise {task_id} --max-attempts 1 --model {local_model} --max-cycles 0");
+        format!("/supervise {task_id} --max-attempts 1 --model {local_model} --max-cycles 0");
     let mut tui = harness_pty(&fixture.path, WIDE)
         .spawn([] as [&str; 0])
         .unwrap();
@@ -268,6 +367,52 @@ fn foreground_supervise_streams_progress_and_reenables_composer() {
 }
 
 #[test]
+fn prompt_first_objective_renders_dashboard_lifecycle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let planner_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        planner_model,
+        [("resp_tui_objective_plan", objective_planner_json())],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let mut tui = harness_pty(&fixture.path, WIDE)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key")
+        .spawn([] as [&str; 0])
+        .unwrap();
+    tui.wait_for_text("Composer", SHORT).unwrap();
+
+    tui.type_text("Create a small Rust maintenance objective")
+        .unwrap();
+    tui.press_enter().unwrap();
+    let planning = tui.wait_for_text("Objective Dashboard", MEDIUM).unwrap();
+    assert!(planning.text.contains("Remote"), "{}", planning.text);
+
+    let completed = tui
+        .wait_for_text("objective complete", Duration::from_secs(20))
+        .unwrap();
+    assert!(
+        completed.text.contains("Objective Dashboard"),
+        "{}",
+        completed.text
+    );
+    assert!(completed.text.contains("Validation"), "{}", completed.text);
+    assert!(completed.text.contains("complete"), "{}", completed.text);
+
+    tui.press_ctrl_d().unwrap();
+    assert_terminal_cleanup(&tui.wait_for_exit(SHORT).unwrap());
+}
+
+#[test]
 fn ctrl_c_during_foreground_supervise_requests_cancellation_and_shows_next_command() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
@@ -278,7 +423,7 @@ fn ctrl_c_during_foreground_supervise_requests_cancellation_and_shows_next_comma
     let task_id = seeded_task_with_validation(&fixture.path, &ollama, &openai, "/bin/sleep 2");
 
     let command =
-        format!("supervise {task_id} --max-attempts 1 --model {local_model} --max-cycles 0");
+        format!("/supervise {task_id} --max-attempts 1 --model {local_model} --max-cycles 0");
     let mut tui = harness_pty(&fixture.path, WIDE)
         .spawn([] as [&str; 0])
         .unwrap();
@@ -425,6 +570,50 @@ fn create_task(binary: &BinaryHarness, title: &str, validation: &str) -> String 
     json["data"]["task_id"].as_str().unwrap().to_string()
 }
 
+fn create_stuck_ticket(binary: &BinaryHarness, task_id: &str, model: &str) -> String {
+    let ran = binary.run([
+        "--output",
+        "json",
+        "task",
+        "run",
+        task_id,
+        "--max-attempts",
+        "1",
+        "--model",
+        model,
+    ]);
+    assert_eq!(
+        ran.status.code(),
+        Some(10),
+        "stdout:\n{}\nstderr:\n{}",
+        ran.stdout,
+        ran.stderr
+    );
+    let json: Value = serde_json::from_str(ran.stdout.trim()).unwrap();
+    assert_eq!(json["status"], "stuck", "{json:#?}");
+    json["data"]["ticket_id"].as_str().unwrap().to_string()
+}
+
+fn create_objective(binary: &BinaryHarness) -> String {
+    let started = binary.run([
+        "--output",
+        "json",
+        "objective",
+        "start",
+        "--prompt",
+        "Create a small Rust maintenance objective",
+    ]);
+    assert!(
+        started.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        started.stdout,
+        started.stderr
+    );
+    let json: Value = serde_json::from_str(started.stdout.trim()).unwrap();
+    assert_eq!(json["status"], "complete", "{json:#?}");
+    json["data"]["objective_id"].as_str().unwrap().to_string()
+}
+
 fn cargo_validation_command() -> String {
     let rust_tool_dir = Path::new(env!("CARGO")).parent().unwrap().to_string_lossy();
     format!("PATH={rust_tool_dir}:/usr/bin:/bin {} test", env!("CARGO"))
@@ -432,4 +621,30 @@ fn cargo_validation_command() -> String {
 
 fn success_patch() -> &'static str {
     "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,5 @@\n pub fn add(left: i32, right: i32) -> i32 {\n-    left - right\n+    left + right\n }\n \n #[cfg(test)]\n\n```"
+}
+
+fn objective_planner_json() -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "objective": {
+            "title": "Maintain Rust project",
+            "summary": "Run a small validation-backed Rust maintenance objective.",
+            "acceptance_criteria": ["filtered cargo test passes"],
+            "validation_commands": ["cargo test validate_project"]
+        },
+        "tasks": [
+            {
+                "task_key": "validate_project",
+                "title": "Validate project",
+                "goal": "Confirm the Rust project remains valid.",
+                "validation": ["cargo test validate_project"],
+                "depends_on": [],
+                "owned_paths": ["src"],
+                "parallel_group": "validation"
+            }
+        ],
+        "risks": [],
+        "final_verification": ["cargo test validate_project"]
+    })
+    .to_string()
 }

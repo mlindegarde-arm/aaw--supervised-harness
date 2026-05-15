@@ -192,6 +192,195 @@ fn binary_harness_fake_provider_receives_records_and_scripts_requests() {
 }
 
 #[test]
+fn binary_objective_start_supervise_success_emits_strict_json_and_objective_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    make_rust_success_fixture_pass(&fixture.path);
+    let local_model = "binary-local-model";
+    let planner_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(
+        local_model,
+        [
+            "STUCK\nreason: need implementation guidance\nquestion: Which source-level maintenance change should be made?".to_string(),
+            passing_add_patch().to_string(),
+        ],
+    );
+    let openai = FakeOpenAiServer::scripted(
+        planner_model,
+        [
+            ("resp_objective_success", objective_planner_json()),
+            ("resp_objective_resolver", objective_resolver_json()),
+        ],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let output = binary.run([
+        "--output",
+        "json",
+        "objective",
+        "start",
+        "--prompt",
+        "Create a small Rust maintenance objective",
+        "--supervise",
+        "--max-worker-attempts",
+        "2",
+        "--max-cycles",
+        "16",
+    ]);
+
+    let json = assert_binary_json_contract(&output, "complete", 0);
+    assert_eq!(json["data"]["status"], "complete", "{json:#?}");
+    assert_eq!(json["data"]["terminal"], true, "{json:#?}");
+    assert_eq!(json["data"]["validation"]["status"], "passed", "{json:#?}");
+    assert_eq!(json["data"]["validation"]["commands_run"], 1, "{json:#?}");
+
+    let events = assert_objective_ndjson_events(&output.stderr);
+    for expected in [
+        "objective.planning_started",
+        "objective.planning_completed",
+        "objective.supervision_started",
+        "objective.worker_started",
+        "objective.ticket_detected",
+        "objective.ticket_resolution_started",
+        "objective.ticket_resolution_completed",
+        "objective.worker_resumed",
+        "objective.worker_completed",
+        "objective.validation_passed",
+        "objective.completed",
+    ] {
+        assert!(
+            events.iter().any(|event| event["event"] == expected),
+            "missing {expected} in {events:#?}"
+        );
+    }
+    assert_eq!(
+        provider_requests_for_path(&ollama.requests(), "/api/generate").len(),
+        2
+    );
+    assert_eq!(
+        provider_requests_for_path(&openai.requests(), "/responses").len(),
+        2
+    );
+}
+
+#[test]
+fn binary_objective_start_supervise_blocked_emits_strict_json_and_objective_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let planner_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch(), success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        planner_model,
+        [
+            ("resp_objective_success", objective_planner_json()),
+            ("resp_objective_resolver", objective_resolver_json()),
+        ],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let output = binary.run([
+        "--output",
+        "json",
+        "objective",
+        "start",
+        "--prompt",
+        "Create a small Rust maintenance objective",
+        "--supervise",
+        "--max-worker-attempts",
+        "2",
+        "--max-cycles",
+        "16",
+    ]);
+
+    let json = assert_binary_json_contract(&output, "failed", 1);
+    assert_eq!(json["data"]["status"], "blocked", "{json:#?}");
+    assert_eq!(json["data"]["terminal"], true, "{json:#?}");
+    assert_eq!(json["data"]["validation"]["status"], "skipped", "{json:#?}");
+
+    let events = assert_objective_ndjson_events(&output.stderr);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "objective.planning_started"),
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "objective.planning_completed"),
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "objective.blocked"),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn binary_objective_start_rejects_malformed_planner_output_with_strict_json_contract() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
+    let local_model = "binary-local-model";
+    let planner_model = "binary-ticket-model";
+    let ollama = FakeOllamaServer::scripted(local_model, [success_patch()]);
+    let openai = FakeOpenAiServer::scripted(
+        planner_model,
+        [("resp_objective_malformed", "not valid planner json")],
+    );
+    let binary = BinaryHarness::new()
+        .current_dir(&fixture.path)
+        .env("ARM_OPENAI_API_KEY", "binary-test-key")
+        .env("OPENAI_API_KEY", "binary-test-key");
+
+    binary.init_repo_json(&fixture.path);
+    inject_fake_provider_config(&fixture.path, &ollama.base_url(), &openai.base_url());
+
+    let output = binary.run([
+        "--output",
+        "json",
+        "objective",
+        "start",
+        "--prompt",
+        "Create a small Rust maintenance objective",
+        "--supervise",
+        "--max-worker-attempts",
+        "1",
+        "--max-cycles",
+        "8",
+    ]);
+
+    let json = assert_binary_json_contract(&output, "usage", 2);
+    assert_eq!(json["data"]["status"], "failed", "{json:#?}");
+    assert_eq!(json["data"]["terminal"], true, "{json:#?}");
+    let events = assert_objective_ndjson_events(&output.stderr);
+    assert_eq!(
+        events[0]["event"], "objective.planning_started",
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "objective.plan_rejected"),
+        "{events:#?}"
+    );
+}
+
+#[test]
 fn binary_harness_sanitizes_inherited_provider_override_env() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
@@ -1911,6 +2100,39 @@ fn assert_supervise_ndjson_phases(stderr: &str, expected_phases: &[&str]) -> Vec
     events
 }
 
+fn assert_objective_ndjson_events(stderr: &str) -> Vec<Value> {
+    assert!(
+        !stderr.trim().is_empty(),
+        "expected objective NDJSON on stderr"
+    );
+    assert!(
+        !stderr.contains("info:") && !stderr.contains("warn:") && !stderr.contains("error:"),
+        "{stderr}"
+    );
+    let events = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap_or_else(|_| panic!("{line}")))
+        .collect::<Vec<_>>();
+    for event in &events {
+        let event_name = event["event"].as_str().unwrap_or("<missing>");
+        assert!(
+            event_name.starts_with("objective."),
+            "expected objective event, got {event:#?}"
+        );
+        assert_eq!(event["schema_version"], 1, "{event:#?}");
+        assert!(event["objective_id"].as_str().is_some(), "{event:#?}");
+        assert!(event["phase"].as_str().is_some(), "{event:#?}");
+        assert!(event["status"].as_str().is_some(), "{event:#?}");
+        assert!(
+            event["message"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{event:#?}"
+        );
+    }
+    events
+}
+
 fn assert_nonzero_next_commands(value: &Value) {
     assert_ne!(value["exit_code"], 0, "{value:#?}");
     assert!(
@@ -2918,6 +3140,83 @@ fn assert_no_secret_in_artifact_tree(root: &Path) {
 
 fn success_patch() -> &'static str {
     "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,5 @@\n pub fn add(left: i32, right: i32) -> i32 {\n-    left - right\n+    left + right\n }\n \n #[cfg(test)]\n\n```"
+}
+
+fn passing_add_patch() -> &'static str {
+    "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,5 @@\n pub fn add(left: i32, right: i32) -> i32 {\n-    left + right\n+    left.checked_add(right).unwrap()\n }\n \n #[cfg(test)]\n\n```"
+}
+
+fn make_rust_success_fixture_pass(repo: &Path) {
+    fs::write(
+        repo.join("src/lib.rs"),
+        r#"pub fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_numbers() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#,
+    )
+    .expect("write passing fixture lib.rs");
+    let add = Command::new("git")
+        .args(["add", "src/lib.rs"])
+        .current_dir(repo)
+        .output()
+        .expect("git add passing fixture");
+    assert!(add.status.success(), "{add:?}");
+    let commit = Command::new("git")
+        .args(["commit", "-m", "make fixture pass before objective"])
+        .current_dir(repo)
+        .output()
+        .expect("git commit passing fixture");
+    assert!(commit.status.success(), "{commit:?}");
+}
+
+fn objective_planner_json() -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "objective": {
+            "title": "Maintain Rust project",
+            "summary": "Run a small validation-backed Rust maintenance objective.",
+            "acceptance_criteria": ["cargo test passes"],
+            "validation_commands": ["cargo test"]
+        },
+        "tasks": [
+            {
+                "task_key": "validate_project",
+                "title": "Validate project",
+                "goal": "Confirm the Rust project remains valid.",
+                "validation": ["cargo test"],
+                "depends_on": [],
+                "owned_paths": ["src"],
+                "parallel_group": "validation"
+            }
+        ],
+        "risks": [],
+        "final_verification": ["cargo test"]
+    })
+    .to_string()
+}
+
+fn objective_resolver_json() -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "diagnosis": "The local worker should apply the addition fix and rerun the focused validation.",
+        "recommended_steps": [
+            "Apply the existing arithmetic patch.",
+            "Rerun cargo test validate_project."
+        ],
+        "constraints": ["Do not change unrelated behavior."],
+        "validation_focus": ["cargo test validate_project"]
+    })
+    .to_string()
 }
 
 fn secret_success_patch() -> String {

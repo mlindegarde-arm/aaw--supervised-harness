@@ -2,8 +2,8 @@ use crate::domain::{Task, TaskId, Ticket, TicketId};
 use crate::error::{HarnessError, HarnessResult};
 use crate::interactive;
 use crate::runtime::{
-    CommandExit, CommandResult, CommandRuntime, HumanSink, JsonSink, OutputMode, ResumeTaskOptions,
-    TaskRunOptions, TicketResolveOptions,
+    CommandExit, CommandResult, CommandRuntime, HumanSink, JsonSink, OutputMode, OutputSink,
+    ResumeTaskOptions, TaskRunOptions, TicketResolveOptions,
 };
 use crate::service::{DefaultHarnessService, HarnessService};
 use std::io::{BufRead, IsTerminal, Write};
@@ -53,7 +53,24 @@ where
     S: Into<String>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    let tokens = args.into_iter().skip(1).collect::<Vec<_>>();
+    let mut tokens = args.into_iter().skip(1).collect::<Vec<_>>();
+    if let Err(error) = resolve_objective_stdin_prompt(&mut tokens, stdin) {
+        let output_mode = output_mode_hint(&tokens).unwrap_or(OutputMode::Human);
+        let exit = CommandExit::usage(error.to_string());
+        let result = CommandResult::new(exit.clone());
+        return match output_mode {
+            OutputMode::Human => {
+                let mut sink = HumanSink::new(stdout, stderr, false);
+                let _ = sink.finish(&result);
+                exit
+            }
+            OutputMode::Json => {
+                let mut sink = JsonSink::new(stdout, stderr, false);
+                let _ = sink.finish(&result);
+                exit
+            }
+        };
+    }
 
     let service = command_service(&tokens);
     let runtime = CommandRuntime::new(service.as_ref());
@@ -63,6 +80,27 @@ where
     }
 
     dispatch_tokens(tokens, stdout, stderr, &runtime)
+}
+
+fn resolve_objective_stdin_prompt(
+    tokens: &mut Vec<String>,
+    stdin: &mut dyn BufRead,
+) -> HarnessResult<()> {
+    let objective_start = tokens
+        .windows(2)
+        .any(|window| window[0] == "objective" && window[1] == "start");
+    if !objective_start {
+        return Ok(());
+    }
+    let Some(stdin_index) = tokens.iter().position(|token| token == "--stdin") else {
+        return Ok(());
+    };
+    let mut prompt = String::new();
+    stdin
+        .read_to_string(&mut prompt)
+        .map_err(|error| HarnessError::External(format!("read objective prompt stdin: {error}")))?;
+    tokens.splice(stdin_index..=stdin_index, ["--prompt".to_string(), prompt]);
+    Ok(())
 }
 
 fn command_service(tokens: &[String]) -> Box<dyn HarnessService> {

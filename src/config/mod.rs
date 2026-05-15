@@ -1012,10 +1012,10 @@ mod tests {
             config.providers.openai.base_url,
             "https://openai-api-proxy.geo.arm.com/api/providers/openai-us/v1"
         );
-        assert_eq!(config.providers.openai.api_key_env, "ARM_OPENAI_API_KEY");
+        assert_eq!(config.providers.openai.api_key_env, "OPENAI_API_KEY");
         assert_eq!(
             config.providers.openai.fallback_api_key_env,
-            "OPENAI_API_KEY"
+            "ARM_OPENAI_API_KEY"
         );
         assert_eq!(config.providers.openai.default_model, "gpt-5.3-codex");
         assert_eq!(config.providers.openai.connect_timeout_seconds, 10);
@@ -1067,8 +1067,8 @@ keep_alive = "5m"
 
 [providers.openai]
 base_url = "https://openai-api-proxy.geo.arm.com/api/providers/openai-us/v1"
-api_key_env = "ARM_OPENAI_API_KEY"
-fallback_api_key_env = "OPENAI_API_KEY"
+api_key_env = "OPENAI_API_KEY"
+fallback_api_key_env = "ARM_OPENAI_API_KEY"
 default_model = "gpt-5.3-codex"
 connect_timeout_seconds = 10
 timeout_seconds = 120

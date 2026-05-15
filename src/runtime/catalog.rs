@@ -64,8 +64,10 @@ pub enum ValueKind {
     Shell,
     TaskStatus,
     TicketStatus,
+    ObjectiveStatus,
     TaskId,
     TicketId,
+    ObjectiveId,
     Path,
     Model,
     FreeText,
@@ -89,6 +91,9 @@ pub enum StateQueryKind {
     TicketId {
         statuses: &'static [&'static str],
         scoped_to_task_arg: bool,
+    },
+    ObjectiveId {
+        statuses: &'static [&'static str],
     },
 }
 
@@ -430,6 +435,99 @@ const COMMANDS: &[CommandNodeSpec] = &[
         action: CommandAction::Dispatch,
     },
     CommandNodeSpec {
+        name: "objective",
+        about: "Manage objectives.",
+        aliases: &[],
+        hidden: false,
+        examples: &[],
+        children: &[
+            CommandNodeSpec {
+                name: "start",
+                about: "Start an objective from a prompt.",
+                aliases: &[],
+                hidden: false,
+                examples: &[
+                    "harness objective start [<prompt>...] [--prompt <text>|--prompt-file <path>|--stdin] [--supervise] [--planner-model <model>] [--worker-model <model>] [--ticket-model <model>] [--max-worker-attempts <n>] [--max-cycles <n>]",
+                ],
+                children: &[],
+                positionals: &[objective_prompt_positional()],
+                options: &OBJECTIVE_START_OPTIONS,
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "list",
+                about: "List objectives.",
+                aliases: &[],
+                hidden: false,
+                examples: &["harness objective list [--status <status>]"],
+                children: &[],
+                positionals: &[],
+                options: &[objective_status_option()],
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "get",
+                about: "Show an objective.",
+                aliases: &[],
+                hidden: false,
+                examples: &["harness objective get <objective-id>"],
+                children: &[],
+                positionals: &[objective_id_positional(true)],
+                options: &[],
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "plan",
+                about: "Show an objective plan.",
+                aliases: &[],
+                hidden: false,
+                examples: &["harness objective plan <objective-id>"],
+                children: &[],
+                positionals: &[objective_id_positional(true)],
+                options: &[],
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "validate",
+                about: "Validate an objective.",
+                aliases: &[],
+                hidden: false,
+                examples: &["harness objective validate <objective-id> [--dry-run]"],
+                children: &[],
+                positionals: &[objective_id_positional(true)],
+                options: &[flag_option("dry-run")],
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "supervise",
+                about: "Supervise an objective.",
+                aliases: &[],
+                hidden: false,
+                examples: &[
+                    "harness objective supervise <objective-id> [--worker-model <model>] [--ticket-model <model>] [--max-worker-attempts <n>] [--max-cycles <n>]",
+                ],
+                children: &[],
+                positionals: &[objective_id_positional(true)],
+                options: &OBJECTIVE_SUPERVISE_OPTIONS,
+                action: CommandAction::Placeholder,
+            },
+            CommandNodeSpec {
+                name: "cancel",
+                about: "Cancel an objective.",
+                aliases: &[],
+                hidden: false,
+                examples: &["harness objective cancel <objective-id>"],
+                children: &[],
+                positionals: &[objective_id_positional(true)],
+                options: &[],
+                action: CommandAction::Placeholder,
+            },
+        ],
+        positionals: &[],
+        options: &[],
+        action: CommandAction::Dispatch,
+    },
+    CommandNodeSpec {
         name: "resume",
         about: "Resume a task after ticket resolution.",
         aliases: &[],
@@ -563,6 +661,25 @@ const CREATE_TASK_OPTIONS: &[OptionSpec] = &[
     title_option(true),
     goal_option(true),
     validation_option(true),
+];
+
+const OBJECTIVE_START_OPTIONS: &[OptionSpec] = &[
+    objective_prompt_option(),
+    objective_prompt_file_option(),
+    objective_stdin_option(),
+    flag_option("supervise"),
+    planner_model_option(),
+    worker_model_option(),
+    ticket_model_option(),
+    max_worker_attempts_option(),
+    max_cycles_option(),
+];
+
+const OBJECTIVE_SUPERVISE_OPTIONS: &[OptionSpec] = &[
+    worker_model_option(),
+    ticket_model_option(),
+    max_worker_attempts_option(),
+    max_cycles_option(),
 ];
 
 const META_COMMANDS: &[MetaCommandSpec] = &[
@@ -708,6 +825,24 @@ const fn ticket_status_option() -> OptionSpec {
     }
 }
 
+const fn objective_status_option() -> OptionSpec {
+    OptionSpec {
+        long: "status",
+        short: None,
+        value_name: Some("status"),
+        value: Some(ValueSpec {
+            kind: ValueKind::ObjectiveStatus,
+            source: ValueSource::Static(&OBJECTIVE_STATUSES),
+            help: "objective status",
+        }),
+        required: false,
+        repeatable: false,
+        action: OptionAction::Set,
+        requires: &[],
+        conflicts_with: &[],
+    }
+}
+
 const fn task_id_positional(required: bool) -> PositionalSpec {
     PositionalSpec {
         name: "task-id",
@@ -740,6 +875,88 @@ const fn ticket_id_positional(required: bool) -> PositionalSpec {
         required_unless_present: &[],
         repeatable: false,
         conflicts_with: &[],
+    }
+}
+
+const fn objective_id_positional(required: bool) -> PositionalSpec {
+    PositionalSpec {
+        name: "objective-id",
+        value: ValueSpec {
+            kind: ValueKind::ObjectiveId,
+            source: ValueSource::StateQuery(StateQueryKind::ObjectiveId {
+                statuses: &OBJECTIVE_STATUSES,
+            }),
+            help: "objective id",
+        },
+        required,
+        required_unless_present: &[],
+        repeatable: false,
+        conflicts_with: &[],
+    }
+}
+
+const fn objective_prompt_positional() -> PositionalSpec {
+    PositionalSpec {
+        name: "prompt-args",
+        value: ValueSpec {
+            kind: ValueKind::FreeText,
+            source: ValueSource::NoCompletion,
+            help: "objective prompt",
+        },
+        required: false,
+        required_unless_present: &["prompt", "prompt-file", "stdin"],
+        repeatable: true,
+        conflicts_with: &["prompt", "prompt-file", "stdin"],
+    }
+}
+
+const fn objective_prompt_option() -> OptionSpec {
+    OptionSpec {
+        long: "prompt",
+        short: None,
+        value_name: Some("text"),
+        value: Some(ValueSpec {
+            kind: ValueKind::FreeText,
+            source: ValueSource::NoCompletion,
+            help: "objective prompt text",
+        }),
+        required: false,
+        repeatable: false,
+        action: OptionAction::Set,
+        requires: &[],
+        conflicts_with: &["prompt-file", "stdin", "prompt-args"],
+    }
+}
+
+const fn objective_prompt_file_option() -> OptionSpec {
+    OptionSpec {
+        long: "prompt-file",
+        short: None,
+        value_name: Some("path"),
+        value: Some(ValueSpec {
+            kind: ValueKind::Path,
+            source: ValueSource::FilesystemPath,
+            help: "objective prompt file",
+        }),
+        required: false,
+        repeatable: false,
+        action: OptionAction::Set,
+        requires: &[],
+        conflicts_with: &["prompt", "stdin", "prompt-args"],
+    }
+}
+
+const fn objective_stdin_option() -> OptionSpec {
+    OptionSpec {
+        long: "stdin",
+        short: None,
+        value_name: None,
+        value: None,
+        required: false,
+        repeatable: false,
+        action: OptionAction::SetTrue,
+        requires: &[],
+        conflicts_with: &["prompt", "prompt-file", "prompt-args"],
     }
 }
 
@@ -792,6 +1009,10 @@ const fn ticket_scoped_option() -> OptionSpec {
 
 const fn max_attempts_option() -> OptionSpec {
     positive_integer_option("max-attempts", "n", "local run attempts")
+}
+
+const fn max_worker_attempts_option() -> OptionSpec {
+    positive_integer_option("max-worker-attempts", "n", "local worker attempts")
 }
 
 const fn max_cycles_option() -> OptionSpec {
@@ -855,6 +1076,52 @@ const fn ticket_model_option() -> OptionSpec {
         conflicts_with: &[],
     }
 }
+
+const fn planner_model_option() -> OptionSpec {
+    OptionSpec {
+        long: "planner-model",
+        short: None,
+        value_name: Some("model"),
+        value: Some(ValueSpec {
+            kind: ValueKind::Model,
+            source: ValueSource::HintOnly,
+            help: "remote planner model",
+        }),
+        required: false,
+        repeatable: false,
+        action: OptionAction::Set,
+        requires: &[],
+        conflicts_with: &[],
+    }
+}
+
+const fn worker_model_option() -> OptionSpec {
+    OptionSpec {
+        long: "worker-model",
+        short: None,
+        value_name: Some("model"),
+        value: Some(ValueSpec {
+            kind: ValueKind::Model,
+            source: ValueSource::HintOnly,
+            help: "local worker model",
+        }),
+        required: false,
+        repeatable: false,
+        action: OptionAction::Set,
+        requires: &[],
+        conflicts_with: &[],
+    }
+}
+
+const OBJECTIVE_STATUSES: &[&str] = &[
+    "planning",
+    "ready",
+    "running",
+    "blocked",
+    "complete",
+    "failed",
+    "cancelled",
+];
 
 fn collect_command_specs(
     nodes: &'static [CommandNodeSpec],

@@ -2,6 +2,13 @@ use crate::{HarnessError, HarnessResult};
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
+pub mod validation_command_policy;
+
+pub use validation_command_policy::{
+    RepoPath, RepoPathOptions, ValidationCommandClassification, ValidationCommandPolicy,
+    ValidationCommandReview,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionResult {
     pub text: String,

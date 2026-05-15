@@ -421,7 +421,7 @@ fn parse_ollama_response(value: serde_json::Value) -> ProviderResult<ModelRespon
 }
 
 fn parse_openai_response(value: serde_json::Value) -> ProviderResult<ModelResponse> {
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         return Err(ProviderError::new(
             ProviderErrorKind::BadRequest,
             format!("OpenAI response error: {error}"),
@@ -433,7 +433,10 @@ fn parse_openai_response(value: serde_json::Value) -> ProviderResult<ModelRespon
             "OpenAI response status was not completed",
         ));
     }
-    if let Some(incomplete) = value.get("incomplete_details") {
+    if let Some(incomplete) = value
+        .get("incomplete_details")
+        .filter(|incomplete| !incomplete.is_null())
+    {
         return Err(ProviderError::new(
             ProviderErrorKind::IncompleteResponse,
             format!("OpenAI response was incomplete: {incomplete}"),
@@ -1407,6 +1410,24 @@ mod tests {
             Some("Bearer test-key")
         );
         assert_eq!(responses.json_body().unwrap()["store"], false);
+    }
+
+    #[test]
+    fn openai_parser_ignores_null_error_field() {
+        let response = parse_openai_response(serde_json::json!({
+            "id": "resp_1",
+            "error": null,
+            "incomplete_details": null,
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "answer"}]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(response.text, "answer");
     }
 
     #[test]

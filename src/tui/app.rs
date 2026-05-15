@@ -1,15 +1,19 @@
 use crate::completion::{
-    CompletionContext, CompletionEngine, CompletionStateView, TaskCompletionItem,
-    TaskCompletionScope, TicketCompletionItem, TicketCompletionScope,
+    CompletionContext, CompletionEngine, CompletionStateView, ObjectiveCompletionItem,
+    ObjectiveCompletionScope, TaskCompletionItem, TaskCompletionScope, TicketCompletionItem,
+    TicketCompletionScope,
 };
+use crate::domain::{ObjectiveStatus, TaskId, TicketId};
 use crate::error::{HarnessError, HarnessResult};
 use crate::runtime::{
-    CommandCatalog, CommandExit, CommandStatus, PaneRunRow, PaneSection, PaneStateSnapshot,
-    TuiRuntimeEvent, build_cli,
+    CommandCatalog, CommandExit, CommandStatus, ObjectiveProgressEvent, ObjectiveProgressKind,
+    ObjectiveProgressPhase, PaneRunRow, PaneSection, PaneStateSnapshot, TuiRuntimeEvent, build_cli,
 };
+use crate::state::Objective;
 use crate::tui::app_state::{CommandActivity, TuiAppState};
-use crate::tui::composer::{ComposerOutcome, ComposerState};
+use crate::tui::composer::{ComposerOutcome, ComposerState, InputMode};
 use crate::tui::input::{ComposerCommand, KeyCode, KeyEvent, KeyModifiers, apply_command};
+use crate::tui::panes::DashboardPaneSnapshot;
 use crate::tui::render::render_app;
 use crate::tui::runtime_bridge::{RuntimeBridge, RuntimeServiceFactory};
 use crate::tui::shell_escape::{
@@ -155,6 +159,13 @@ where
         }
 
         match command {
+            ComposerCommand::Complete if self.composer.input_mode() == InputMode::PlainPrompt => {
+                self.state.append_runtime_event(TuiRuntimeEvent::Stderr(
+                    "prompt text will start an objective; use / for harness commands".to_string(),
+                ));
+                self.sync_composer_view();
+                return;
+            }
             ComposerCommand::Complete if !self.composer.suggestions_visible() => {
                 self.refresh_completion();
             }
@@ -252,7 +263,14 @@ where
             return;
         }
 
-        match self.runtime.start_command(command) {
+        let routed_command = route_prompt_first_command(&command, self.repo.as_deref());
+        if routed_command != command {
+            self.state
+                .append_runtime_event(TuiRuntimeEvent::Stderr(format!(
+                    "starting objective: {routed_command}"
+                )));
+        }
+        match self.runtime.start_command(routed_command) {
             Ok(()) => self.state.set_activity(CommandActivity::Running),
             Err(err) => self
                 .state
@@ -354,12 +372,19 @@ where
             ),
             Err(err) => PaneSection::Error(err.to_string()),
         };
-        self.state.set_pane_snapshot(PaneStateSnapshot {
+        let phase2 = PaneStateSnapshot {
             tasks,
             tickets,
             runs: PaneSection::Ready(Vec::<PaneRunRow>::new()),
             artifacts: PaneSection::Ready(Vec::new()),
-        });
+        };
+        let mut dashboard = DashboardPaneSnapshot::with_phase2(phase2);
+        if let Ok(objectives) = service.list_objectives(None)
+            && let Some(objective) = select_dashboard_objective(&objectives)
+        {
+            hydrate_objective_dashboard(service.as_ref(), &mut dashboard, objective);
+        }
+        self.state.set_dashboard_snapshot(dashboard);
     }
 
     fn sync_composer_view(&mut self) {
@@ -373,6 +398,288 @@ where
             self.state.composer.hint = self.composer.hint_text();
         }
     }
+}
+
+fn route_prompt_first_command(input: &str, repo: Option<&std::path::Path>) -> String {
+    let trimmed = input.trim();
+    if trimmed.starts_with('/') || trimmed.starts_with('!') || legacy_command_like(trimmed) {
+        return trimmed.to_string();
+    }
+    let escaped_prompt = shell_quote(trimmed);
+    let mut command = String::from("objective start --supervise --prompt ");
+    command.push_str(&escaped_prompt);
+    if let Some(repo) = repo.and_then(|path| path.to_str()) {
+        command.push_str(" --repo ");
+        command.push_str(&shell_quote(repo));
+    }
+    command
+}
+
+fn select_dashboard_objective(objectives: &[Objective]) -> Option<&Objective> {
+    objectives
+        .iter()
+        .rev()
+        .find(|objective| {
+            matches!(
+                objective.status,
+                ObjectiveStatus::Planning
+                    | ObjectiveStatus::Ready
+                    | ObjectiveStatus::Running
+                    | ObjectiveStatus::Blocked
+            )
+        })
+        .or_else(|| objectives.last())
+}
+
+fn hydrate_objective_dashboard(
+    service: &dyn crate::service::HarnessService,
+    dashboard: &mut DashboardPaneSnapshot,
+    objective: &Objective,
+) {
+    let mut applied = false;
+    if let Ok(plan) = service.get_objective_plan(&objective.id)
+        && let Some(events) = plan.data.get("events").and_then(|value| value.as_array())
+    {
+        for event in events {
+            if let Some(progress) = progress_from_persisted_event(objective, event) {
+                dashboard.apply_objective_progress(&progress);
+                applied = true;
+            }
+        }
+    }
+
+    if !applied {
+        dashboard.apply_objective_progress(&progress_from_objective(objective));
+    }
+}
+
+fn progress_from_objective(objective: &Objective) -> ObjectiveProgressEvent {
+    let (kind, phase) = match objective.status {
+        ObjectiveStatus::Planning => (
+            ObjectiveProgressKind::PlanningStarted,
+            ObjectiveProgressPhase::Planning,
+        ),
+        ObjectiveStatus::Ready => (
+            ObjectiveProgressKind::PlanningCompleted,
+            ObjectiveProgressPhase::Ready,
+        ),
+        ObjectiveStatus::Running => (
+            ObjectiveProgressKind::SupervisionStarted,
+            ObjectiveProgressPhase::Running,
+        ),
+        ObjectiveStatus::Blocked => (
+            ObjectiveProgressKind::Blocked,
+            ObjectiveProgressPhase::Blocked,
+        ),
+        ObjectiveStatus::Complete => (
+            ObjectiveProgressKind::Completed,
+            ObjectiveProgressPhase::Complete,
+        ),
+        ObjectiveStatus::Failed => (
+            ObjectiveProgressKind::Failed,
+            ObjectiveProgressPhase::Failed,
+        ),
+        ObjectiveStatus::Cancelled => (
+            ObjectiveProgressKind::Cancelled,
+            ObjectiveProgressPhase::Cancelled,
+        ),
+    };
+    ObjectiveProgressEvent::new(
+        kind,
+        objective.id.clone(),
+        phase,
+        objective.status,
+        objective.summary.clone(),
+        objective.updated_at.clone(),
+    )
+}
+
+fn progress_from_persisted_event(
+    objective: &Objective,
+    event: &serde_json::Value,
+) -> Option<ObjectiveProgressEvent> {
+    let event_type = event.get("event_type")?.as_str()?;
+    let message = event
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or(event_type);
+    let timestamp = event
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&objective.updated_at);
+    let payload = event
+        .get("payload_json")
+        .and_then(|value| value.as_str())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let (kind, phase, status) = objective_event_type_state(event_type, objective.status)?;
+    let mut progress = ObjectiveProgressEvent::new(
+        kind,
+        objective.id.clone(),
+        phase,
+        status,
+        message.to_string(),
+        timestamp.to_string(),
+    );
+    progress.task_id = payload
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| TaskId::parse(value).ok());
+    progress.ticket_id = payload
+        .get("ticket_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| TicketId::parse(value).ok());
+    Some(progress)
+}
+
+fn objective_event_type_state(
+    event_type: &str,
+    objective_status: ObjectiveStatus,
+) -> Option<(
+    ObjectiveProgressKind,
+    ObjectiveProgressPhase,
+    ObjectiveStatus,
+)> {
+    Some(match event_type {
+        "objective.planning_started" => (
+            ObjectiveProgressKind::PlanningStarted,
+            ObjectiveProgressPhase::Planning,
+            ObjectiveStatus::Planning,
+        ),
+        "objective.plan_accepted" | "objective.planning_completed" => (
+            ObjectiveProgressKind::PlanningCompleted,
+            ObjectiveProgressPhase::Ready,
+            ObjectiveStatus::Ready,
+        ),
+        "objective.plan_rejected" => (
+            ObjectiveProgressKind::PlanRejected,
+            ObjectiveProgressPhase::Failed,
+            ObjectiveStatus::Failed,
+        ),
+        "objective.supervision_started" => (
+            ObjectiveProgressKind::SupervisionStarted,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.worker_started" => (
+            ObjectiveProgressKind::WorkerStarted,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.worker_completed" => (
+            ObjectiveProgressKind::WorkerCompleted,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.ticket_detected" => (
+            ObjectiveProgressKind::TicketDetected,
+            ObjectiveProgressPhase::Blocked,
+            ObjectiveStatus::Blocked,
+        ),
+        "objective.ticket_resolution_started" => (
+            ObjectiveProgressKind::TicketResolutionStarted,
+            ObjectiveProgressPhase::Resolving,
+            ObjectiveStatus::Running,
+        ),
+        "objective.ticket_resolution_completed" => (
+            ObjectiveProgressKind::TicketResolutionCompleted,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.worker_resumed" => (
+            ObjectiveProgressKind::WorkerResumed,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.validation_started" => (
+            ObjectiveProgressKind::ValidationStarted,
+            ObjectiveProgressPhase::Validating,
+            ObjectiveStatus::Running,
+        ),
+        "objective.validation_failed" => (
+            ObjectiveProgressKind::ValidationFailed,
+            ObjectiveProgressPhase::Validating,
+            ObjectiveStatus::Running,
+        ),
+        "objective.repair_task_created" => (
+            ObjectiveProgressKind::RepairTaskCreated,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+        ),
+        "objective.validation_passed" => (
+            ObjectiveProgressKind::ValidationPassed,
+            ObjectiveProgressPhase::Validating,
+            ObjectiveStatus::Running,
+        ),
+        "objective.completed" => (
+            ObjectiveProgressKind::Completed,
+            ObjectiveProgressPhase::Complete,
+            ObjectiveStatus::Complete,
+        ),
+        "objective.blocked" => (
+            ObjectiveProgressKind::Blocked,
+            ObjectiveProgressPhase::Blocked,
+            ObjectiveStatus::Blocked,
+        ),
+        "objective.failed" => (
+            ObjectiveProgressKind::Failed,
+            ObjectiveProgressPhase::Failed,
+            ObjectiveStatus::Failed,
+        ),
+        "objective.cancel_requested" => (
+            ObjectiveProgressKind::CancelRequested,
+            ObjectiveProgressPhase::Cancelled,
+            objective_status,
+        ),
+        "objective.cancelled" => (
+            ObjectiveProgressKind::Cancelled,
+            ObjectiveProgressPhase::Cancelled,
+            ObjectiveStatus::Cancelled,
+        ),
+        _ => return None,
+    })
+}
+
+fn legacy_command_like(input: &str) -> bool {
+    let mut tokens = input.split_whitespace();
+    let Some(root) = tokens.next() else {
+        return false;
+    };
+    let second = tokens.next();
+    match root {
+        "task" => matches!(second, Some("create" | "list" | "get" | "run" | "cleanup")),
+        "ticket" => matches!(second, Some("list" | "get" | "resolve")),
+        "objective" => matches!(
+            second,
+            Some("start" | "list" | "get" | "plan" | "validate" | "supervise" | "cancel")
+        ),
+        "config" => matches!(second, Some("get" | "set")),
+        "workspace" => matches!(second, Some("prune")),
+        "resume" | "supervise" => {
+            second.is_some_and(|token| token.starts_with("task_") || token.starts_with("--"))
+        }
+        "run" => {
+            input.contains("--title") || input.contains("--goal") || input.contains("--validation")
+        }
+        "init" | "doctor" | "completions" | "version" => {
+            second.is_none() || second.is_some_and(|token| token.starts_with("--"))
+        }
+        "help" => second.is_none(),
+        _ => false,
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 #[derive(Clone)]
@@ -429,6 +736,29 @@ impl CompletionStateView for ServiceCompletionState {
                 run_id: ticket.run_id,
                 status: ticket.status,
                 summary: ticket.question,
+            })
+            .collect())
+    }
+
+    fn objectives_for_completion(
+        &self,
+        scope: ObjectiveCompletionScope,
+    ) -> HarnessResult<Vec<ObjectiveCompletionItem>> {
+        let status_filter = if scope.statuses.len() == 1 {
+            Some(crate::domain::ObjectiveStatus::parse(scope.statuses[0])?)
+        } else {
+            None
+        };
+
+        Ok(self
+            .service()
+            .list_objectives(status_filter)?
+            .into_iter()
+            .filter(|objective| scope.statuses.contains(&objective.status.as_str()))
+            .map(|objective| ObjectiveCompletionItem {
+                id: objective.id,
+                status: objective.status,
+                title: objective.title,
             })
             .collect())
     }
@@ -512,8 +842,8 @@ mod tests {
     use crate::HarnessResult;
     use crate::domain::{Task, TaskId, Ticket, TicketId};
     use crate::runtime::{
-        CommandResult, ResumeTaskOptions, SuperviseCreateOptions, SuperviseTaskOptions,
-        TaskRunOptions, TicketResolveOptions,
+        CommandResult, ObjectivePromptInput, ObjectiveStartOptions, ResumeTaskOptions,
+        SuperviseCreateOptions, SuperviseTaskOptions, TaskRunOptions, TicketResolveOptions,
     };
     use crate::service::HarnessService;
     use crate::workspace::{CommandOutput, CommandSpec};
@@ -521,6 +851,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const TASK_ID: &str = "task_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const TICKET_ID: &str = "ticket_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const OBJECTIVE_ID: &str = "objective_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
     #[test]
     fn terminal_cleanup_guard_restores_on_normal_leave_and_drop() {
@@ -544,7 +876,7 @@ mod tests {
             Arc::new(|| Box::new(SlowService)),
             FakeShellRunner::default(),
         );
-        app.composer.set_text(format!("supervise {TASK_ID}"));
+        app.composer.set_text(format!("/supervise {TASK_ID}"));
         app.handle_command(ComposerCommand::SubmitOrApplySuggestion);
 
         assert!(app.state.composer.disabled);
@@ -562,7 +894,7 @@ mod tests {
             Arc::new(|| Box::new(SlowService)),
             FakeShellRunner::default(),
         );
-        app.composer.set_text(format!("supervise {TASK_ID}"));
+        app.composer.set_text(format!("/supervise {TASK_ID}"));
         app.handle_command(ComposerCommand::SubmitOrApplySuggestion);
         app.handle_command(ComposerCommand::Interrupt);
 
@@ -631,6 +963,97 @@ mod tests {
                 .transcript
                 .entries()
                 .any(|entry| entry.text == "cancellation acknowledged")
+        );
+    }
+
+    #[test]
+    fn prompt_first_plain_text_starts_supervised_objective() {
+        let mut app = TuiApp::with_shell_runner(
+            Arc::new(|| Box::new(FakeService)),
+            FakeShellRunner::default(),
+        );
+        app.repo = Some(PathBuf::from("/prompt-repo"));
+        app.composer.set_text("Create a Rust CLI");
+        app.handle_command(ComposerCommand::SubmitOrApplySuggestion);
+
+        assert!(
+            app.state
+                .transcript
+                .entries()
+                .any(|entry| entry.text.contains("Create a Rust CLI"))
+        );
+        assert!(
+            app.state
+                .transcript
+                .entries()
+                .any(|entry| entry.text.contains("/prompt-repo"))
+        );
+    }
+
+    #[test]
+    fn slash_command_routes_existing_runtime_command() {
+        let mut app = TuiApp::with_shell_runner(
+            Arc::new(|| Box::new(FakeService)),
+            FakeShellRunner::default(),
+        );
+        app.composer.set_text("/supervise ".to_string() + TASK_ID);
+        app.handle_command(ComposerCommand::SubmitOrApplySuggestion);
+        collect_until_idle(&mut app);
+
+        assert!(
+            app.state
+                .transcript
+                .entries()
+                .any(|entry| entry.text.contains("inspecting"))
+        );
+        assert!(
+            !app.state
+                .transcript
+                .entries()
+                .any(|entry| entry.text.contains("starting objective"))
+        );
+    }
+
+    #[test]
+    fn plain_known_command_root_shows_compatibility_warning() {
+        let mut app = TuiApp::with_shell_runner(
+            Arc::new(|| Box::new(FakeService)),
+            FakeShellRunner::default(),
+        );
+        app.composer.set_text("task list");
+        app.handle_command(ComposerCommand::Complete);
+
+        assert!(
+            app.state
+                .transcript
+                .entries()
+                .any(|entry| entry.text.contains("use / for harness commands"))
+                || app
+                    .state
+                    .composer
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("Use /task"))
+        );
+    }
+
+    #[test]
+    fn dashboard_hydrates_from_persisted_objective_events() {
+        let objective = sample_objective(ObjectiveStatus::Running);
+        let mut dashboard = DashboardPaneSnapshot::default();
+        let service = ObjectiveHistoryService {
+            objective: objective.clone(),
+        };
+
+        hydrate_objective_dashboard(&service, &mut dashboard, &objective);
+
+        let objective = dashboard.objective.as_ref().unwrap();
+        assert_eq!(objective.objective.phase, "resolving");
+        assert!(
+            matches!(&objective.remote_activity, PaneSection::Ready(rows) if rows.iter().any(|row| row.id == "planner" && row.status == "accepted"))
+        );
+        assert!(
+            matches!(&objective.tickets, PaneSection::Ready(rows) if rows.iter().any(|row| row.id == TICKET_ID && row.status == "resolving"))
         );
     }
 
@@ -785,6 +1208,139 @@ mod tests {
             _options: SuperviseCreateOptions,
         ) -> HarnessResult<CommandResult> {
             unreachable!()
+        }
+
+        fn start_objective(&self, options: ObjectiveStartOptions) -> HarnessResult<CommandResult> {
+            let objective_id = crate::domain::ObjectiveId::parse(OBJECTIVE_ID).unwrap();
+            let prompt = match options.prompt {
+                ObjectivePromptInput::Text(text) => text,
+                ObjectivePromptInput::File(path) => path.to_string_lossy().into_owned(),
+                ObjectivePromptInput::Stdin => "stdin".to_string(),
+            };
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                serde_json::json!({
+                    "objective_id": objective_id.as_str(),
+                    "prompt": prompt,
+                    "supervise": options.supervise,
+                    "repo": options.runtime.repo.as_ref().map(|path| path.to_string_lossy().to_string()),
+                }),
+            ))
+        }
+    }
+
+    struct ObjectiveHistoryService {
+        objective: Objective,
+    }
+
+    impl HarnessService for ObjectiveHistoryService {
+        fn create_task(
+            &self,
+            _title: String,
+            _goal: String,
+            _validation_commands: Vec<String>,
+        ) -> HarnessResult<Task> {
+            unreachable!()
+        }
+
+        fn list_tasks(&self) -> HarnessResult<Vec<Task>> {
+            Ok(Vec::new())
+        }
+
+        fn list_objectives(
+            &self,
+            _status: Option<ObjectiveStatus>,
+        ) -> HarnessResult<Vec<Objective>> {
+            Ok(vec![self.objective.clone()])
+        }
+
+        fn get_objective(
+            &self,
+            _objective_id: &crate::domain::ObjectiveId,
+        ) -> HarnessResult<Objective> {
+            Ok(self.objective.clone())
+        }
+
+        fn get_task(&self, _task_id: &TaskId) -> HarnessResult<Task> {
+            unreachable!()
+        }
+
+        fn run_task(
+            &self,
+            _task_id: &TaskId,
+            _options: TaskRunOptions,
+        ) -> HarnessResult<CommandResult> {
+            unreachable!()
+        }
+
+        fn list_tickets(&self) -> HarnessResult<Vec<Ticket>> {
+            Ok(Vec::new())
+        }
+
+        fn get_ticket(&self, _ticket_id: &TicketId) -> HarnessResult<Ticket> {
+            unreachable!()
+        }
+
+        fn resolve_ticket(
+            &self,
+            _ticket_id: &TicketId,
+            _options: TicketResolveOptions,
+        ) -> HarnessResult<CommandResult> {
+            unreachable!()
+        }
+
+        fn resume_task(
+            &self,
+            _task_id: &TaskId,
+            _options: ResumeTaskOptions,
+        ) -> HarnessResult<CommandResult> {
+            unreachable!()
+        }
+
+        fn get_objective_plan(
+            &self,
+            _objective_id: &crate::domain::ObjectiveId,
+        ) -> HarnessResult<CommandResult> {
+            Ok(CommandResult::with_data(
+                CommandExit::success(),
+                serde_json::json!({
+                    "events": [
+                        {
+                            "event_type": "objective.plan_accepted",
+                            "message": "objective plan accepted",
+                            "created_at": "2026-05-14T00:00:01Z",
+                            "payload_json": "{}"
+                        },
+                        {
+                            "event_type": "objective.ticket_resolution_started",
+                            "message": "resolving ticket",
+                            "created_at": "2026-05-14T00:00:02Z",
+                            "payload_json": serde_json::json!({
+                                "task_id": TASK_ID,
+                                "ticket_id": TICKET_ID
+                            }).to_string()
+                        }
+                    ]
+                }),
+            ))
+        }
+    }
+
+    fn sample_objective(status: ObjectiveStatus) -> Objective {
+        Objective {
+            id: crate::domain::ObjectiveId::parse(OBJECTIVE_ID).unwrap(),
+            title: "Build CLI".to_string(),
+            prompt: "Build CLI".to_string(),
+            summary: "Build a CLI".to_string(),
+            status,
+            planner_model: Some("planner".to_string()),
+            worker_model: Some("worker".to_string()),
+            ticket_model: Some("ticket".to_string()),
+            active_plan_id: None,
+            monitor_lease_owner: None,
+            monitor_lease_expires_at: None,
+            created_at: "2026-05-14T00:00:00Z".to_string(),
+            updated_at: "2026-05-14T00:00:03Z".to_string(),
         }
     }
 

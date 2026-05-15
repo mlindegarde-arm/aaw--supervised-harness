@@ -7,6 +7,7 @@ pub mod error;
 pub mod interactive;
 pub mod orchestrator;
 pub mod patch;
+pub mod planner;
 pub mod prompts;
 pub mod providers;
 pub mod runtime;

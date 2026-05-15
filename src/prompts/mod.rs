@@ -1,4 +1,5 @@
 use crate::domain::{Artifact, Run, Task, Ticket, TicketResolution};
+use crate::planner::{PlannerRequest, TicketResolverRequest};
 use crate::{HarnessError, HarnessResult};
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +143,90 @@ pub fn ticket_system_prompt() -> String {
         "Explain the likely cause, the concrete next steps, and any risks the local worker should consider.",
     ]
     .join("\n")
+}
+
+pub fn planner_system_prompt() -> String {
+    [
+        "You are the remote planner for harness objective orchestration.",
+        "Define done, acceptance criteria, validation commands, and a generated task graph.",
+        "Do not output patches, diffs, scripts, provider URLs, or instructions that directly mutate the repository.",
+        "The local worker is the only role allowed to implement code changes.",
+        "Return exactly one JSON object that matches the planner schema. Do not wrap it in markdown or prose.",
+    ]
+    .join("\n")
+}
+
+pub fn ticket_resolver_system_prompt() -> String {
+    [
+        "You are the remote ticket resolver for a stuck harness objective task.",
+        "Diagnose the blocked ticket and return bounded advisory guidance only.",
+        "Do not output patches, diffs, shell scripts, or executable command lists.",
+        "The local worker is the only role allowed to implement code changes.",
+        "Return exactly one JSON object that matches the resolver schema. Do not wrap it in markdown or prose.",
+    ]
+    .join("\n")
+}
+
+pub fn build_planner_prompt(request: PlannerRequest) -> HarnessResult<BuiltPrompt> {
+    let request_json = serde_json::to_string_pretty(&request)
+        .map_err(|error| HarnessError::External(format!("serialize planner request: {error}")))?;
+    Ok(BuiltPrompt {
+        system: Some(planner_system_prompt()),
+        input: format!(
+            "{PROMPT_CONTRACT_VERSION}\n\nPlanner output schema:\n{}\n\nPlanner request:\n{}",
+            planner_output_schema(),
+            request_json
+        ),
+    })
+}
+
+pub fn build_ticket_resolver_prompt(request: TicketResolverRequest) -> HarnessResult<BuiltPrompt> {
+    let request_json = serde_json::to_string_pretty(&request).map_err(|error| {
+        HarnessError::External(format!("serialize ticket resolver request: {error}"))
+    })?;
+    Ok(BuiltPrompt {
+        system: Some(ticket_resolver_system_prompt()),
+        input: format!(
+            "{PROMPT_CONTRACT_VERSION}\n\nResolver output schema:\n{}\n\nResolver request:\n{}",
+            ticket_resolver_output_schema(),
+            request_json
+        ),
+    })
+}
+
+fn planner_output_schema() -> &'static str {
+    r#"{
+  "schema_version": 1,
+  "objective": {
+    "title": "non-empty string",
+    "summary": "non-empty string",
+    "acceptance_criteria": ["non-empty string"],
+    "validation_commands": ["trusted command candidate"]
+  },
+  "tasks": [
+    {
+      "task_key": "lowercase_snake_case",
+      "title": "non-empty string",
+      "goal": "non-empty string",
+      "validation": ["trusted command candidate"],
+      "depends_on": ["other_task_key"],
+      "owned_paths": ["relative/repo/path"],
+      "parallel_group": "non-empty string"
+    }
+  ],
+  "risks": ["string"],
+  "final_verification": ["string"]
+}"#
+}
+
+fn ticket_resolver_output_schema() -> &'static str {
+    r#"{
+  "schema_version": 1,
+  "diagnosis": "non-empty advisory diagnosis",
+  "recommended_steps": ["bounded guidance for the local worker"],
+  "constraints": ["constraints the local worker must preserve"],
+  "validation_focus": ["validation areas or commands to inspect"]
+}"#
 }
 
 pub fn build_ollama_worker_prompt(request: OllamaPromptRequest) -> HarnessResult<BuiltPrompt> {
@@ -491,6 +576,11 @@ fn ceil_char_boundary(input: &str, mut index: usize) -> usize {
 mod tests {
     use super::*;
     use crate::domain::{RunId, RunStatus, TaskId, TaskStatus, TicketId, TicketStatus};
+    use crate::planner::{
+        CONTEXT_MANIFEST_SCHEMA_VERSION, ContextBudget, ContextManifest, TicketResolverStatuses,
+        TicketResolverTaskDetails, TicketResolverTicketDetails, build_planner_request,
+        build_ticket_resolver_request,
+    };
 
     #[test]
     fn prompts_delimit_untrusted_evidence_with_labels_and_byte_counts() {
@@ -653,5 +743,73 @@ mod tests {
         assert_eq!(manifest.validation_command.as_deref(), Some("cargo test"));
         assert_eq!(manifest.truncation.len(), 1);
         assert!(manifest.truncation[0].truncated);
+    }
+
+    #[test]
+    fn planner_prompt_separates_roles_and_embeds_schema() {
+        let prompt = build_planner_prompt(build_planner_request(
+            "Build a CLI",
+            "repo has src/main.rs",
+            empty_context_manifest(),
+        ))
+        .unwrap();
+
+        let system = prompt.system.unwrap();
+        assert!(system.contains("remote planner"));
+        assert!(system.contains("The local worker is the only role allowed"));
+        assert!(system.contains("Do not output patches"));
+        assert!(prompt.input.contains("\"task_key\""));
+        assert!(prompt.input.contains("\"context_manifest\""));
+    }
+
+    #[test]
+    fn resolver_prompt_is_guidance_only_and_embeds_schema() {
+        let prompt = build_ticket_resolver_prompt(build_ticket_resolver_request(
+            "Build a CLI",
+            "Implement command surface",
+            vec!["cargo test passes".to_string()],
+            TicketResolverStatuses {
+                objective_status: "running".to_string(),
+                task_status: "stuck".to_string(),
+                ticket_status: "open".to_string(),
+            },
+            TicketResolverTicketDetails {
+                blocked_on: "validation_failed".to_string(),
+                reason: "missing subcommand".to_string(),
+                question: "What should change?".to_string(),
+            },
+            TicketResolverTaskDetails {
+                title: "Implement CLI".to_string(),
+                goal: "Add subcommands".to_string(),
+                validation_commands: vec!["cargo test cli_surface".to_string()],
+            },
+            Vec::new(),
+            empty_context_manifest(),
+        ))
+        .unwrap();
+
+        let system = prompt.system.unwrap();
+        assert!(system.contains("advisory guidance only"));
+        assert!(system.contains("Do not output patches"));
+        assert!(system.contains("The local worker is the only role allowed"));
+        assert!(prompt.input.contains("\"recommended_steps\""));
+        assert!(prompt.input.contains("\"ticket_details\""));
+    }
+
+    fn empty_context_manifest() -> ContextManifest {
+        ContextManifest {
+            schema_version: CONTEXT_MANIFEST_SCHEMA_VERSION,
+            budget: ContextBudget {
+                total_bytes: 5,
+                objective_bytes: 1,
+                conversation_bytes: 1,
+                state_bytes: 1,
+                artifact_excerpt_bytes: 1,
+                schema_bytes: 1,
+            },
+            included_sections: Vec::new(),
+            omitted_sections: Vec::new(),
+            artifacts: Vec::new(),
+        }
     }
 }

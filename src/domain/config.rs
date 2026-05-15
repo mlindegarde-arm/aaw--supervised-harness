@@ -107,8 +107,8 @@ impl Default for HarnessConfig {
                 openai: OpenAiConfig {
                     base_url: "https://openai-api-proxy.geo.arm.com/api/providers/openai-us/v1"
                         .to_string(),
-                    api_key_env: "ARM_OPENAI_API_KEY".to_string(),
-                    fallback_api_key_env: "OPENAI_API_KEY".to_string(),
+                    api_key_env: "OPENAI_API_KEY".to_string(),
+                    fallback_api_key_env: "ARM_OPENAI_API_KEY".to_string(),
                     default_model: "gpt-5.3-codex".to_string(),
                     connect_timeout_seconds: 10,
                     timeout_seconds: 120,

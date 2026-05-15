@@ -54,7 +54,9 @@ mod tests {
 
         assert!(output.contains("_harness()"), "{output}");
         assert!(output.contains("task"), "{output}");
+        assert!(output.contains("objective"), "{output}");
         assert!(output.contains("completions"), "{output}");
+        assert!(output.contains("planning"), "{output}");
         assert!(output.contains("ready"), "{output}");
         assert!(output.contains("resolved"), "{output}");
     }
@@ -66,6 +68,8 @@ mod tests {
         assert!(output.contains("#compdef harness"), "{output}");
         assert!(output.contains("_harness"), "{output}");
         assert!(output.contains("supervise"), "{output}");
+        assert!(output.contains("objective"), "{output}");
+        assert!(output.contains("planning"), "{output}");
         assert!(output.contains("ready"), "{output}");
         assert!(output.contains("resolved"), "{output}");
     }
@@ -76,7 +80,9 @@ mod tests {
 
         assert!(output.contains("complete -c harness"), "{output}");
         assert!(output.contains("task"), "{output}");
+        assert!(output.contains("objective"), "{output}");
         assert!(output.contains("completions"), "{output}");
+        assert!(output.contains("planning"), "{output}");
         assert!(output.contains("ready"), "{output}");
         assert!(output.contains("resolved"), "{output}");
     }
