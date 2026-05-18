@@ -450,7 +450,7 @@ fn is_trusted_validation(argv: &[String]) -> bool {
 
 fn trusted_cargo(argv: &[String]) -> bool {
     match argv.get(1).map(String::as_str) {
-        Some("test" | "check") => true,
+        Some("test" | "check" | "build") => true,
         Some("fmt") => argv.iter().any(|arg| arg == "--check"),
         Some("clippy") => true,
         _ => false,
@@ -548,7 +548,7 @@ fn lexical_repo_path(raw: &str, options: RepoPathOptions) -> HarnessResult<PathB
             }
         }
     }
-    if relative.as_os_str().is_empty() {
+    if relative.as_os_str().is_empty() && normalized != "." {
         return Err(policy_error("repo path must name an in-repository path"));
     }
     if contains_harness_component(&relative) && !is_approved_harness_path(&relative, &options) {
@@ -625,6 +625,7 @@ mod tests {
             "cargo test validation_command_policy",
             "cargo fmt --check",
             "cargo check",
+            "cargo build",
             "cargo clippy --all-targets",
             "go test ./...",
             "npm test",
@@ -753,6 +754,10 @@ mod tests {
 
         let lexical_path = RepoPath::validate_lexical("src/future.rs").unwrap();
         assert_eq!(lexical_path.relative_path(), Path::new("src/future.rs"));
+
+        let root_path = RepoPath::validate(temp.path(), ".").unwrap();
+        assert_eq!(root_path.as_str(), ".");
+        assert_eq!(root_path.relative_path(), Path::new(""));
     }
 
     #[test]

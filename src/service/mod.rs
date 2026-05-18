@@ -366,13 +366,8 @@ impl HarnessService for DefaultHarnessService {
                 HarnessError::External("objective start did not return an objective_id".to_string())
             })
             .and_then(ObjectiveId::parse)?;
-        let supervise_result = self
-            .orchestrator
-            .supervise_objective(&objective_id, supervise_options)?;
-        for event in &supervise_result.events {
-            sink.event(event)?;
-        }
-        Ok(supervise_result)
+        self.orchestrator
+            .supervise_objective_streaming(&objective_id, supervise_options, sink)
     }
 
     fn get_objective_plan(
@@ -396,6 +391,16 @@ impl HarnessService for DefaultHarnessService {
         options: ObjectiveSuperviseOptions,
     ) -> HarnessResult<CommandResult> {
         self.orchestrator.supervise_objective(objective_id, options)
+    }
+
+    fn supervise_objective_streaming(
+        &self,
+        objective_id: &crate::domain::ObjectiveId,
+        options: ObjectiveSuperviseOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        self.orchestrator
+            .supervise_objective_streaming(objective_id, options, sink)
     }
 
     fn create_and_supervise_task_streaming(

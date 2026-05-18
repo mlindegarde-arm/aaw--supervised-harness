@@ -10,7 +10,9 @@ use crate::runtime::{
     OutputSink, ResumeTaskOptions, SuperviseCreateOptions, SuperviseProgressEvent,
     SuperviseProgressPhase, SuperviseTaskOptions, TaskRunOptions, TicketResolveOptions,
 };
+use crate::state::TaskStore;
 use serde_json::{Value, json};
+use std::fs;
 
 impl RunOrchestrator {
     pub fn supervise_task(
@@ -99,8 +101,7 @@ impl RunOrchestrator {
     ) -> HarnessResult<CommandResult> {
         let cap = options
             .max_cycles
-            .unwrap_or(self.config.orchestrator.max_escalation_cycles)
-            .min(self.config.orchestrator.max_escalation_cycles);
+            .unwrap_or_else(|| self.config.orchestrator.max_escalation_cycles.max(1));
         let mut aggregation = SupervisorAggregation::new(task_id.clone(), cap, progress_sink);
         let mut requested_ticket = options.ticket_id.clone();
 
@@ -141,13 +142,20 @@ impl RunOrchestrator {
                     if cancellation.is_cancelled() {
                         return aggregation.cancelled(task_id);
                     }
+                    let worker_model = options
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| self.config.providers.ollama.default_model.clone());
                     aggregation.push(progress(
                         SuperviseProgressPhase::RunTask,
                         task_id,
                         None,
                         None,
                         Some(0),
-                        format!("running task {}", task_id),
+                        format!(
+                            "running task {} with local Ollama model {}",
+                            task_id, worker_model
+                        ),
                         Some(format!("harness task get {} --output json", task_id)),
                     ))?;
                     let result = self.run_task(
@@ -163,6 +171,7 @@ impl RunOrchestrator {
                         Err(exit) => return aggregation.failed(exit, next_for_task(task_id)),
                     };
                     aggregation.merge(&result);
+                    aggregation.record_worker_output(worker_output(&result, self.store.as_ref())?);
                     match result.exit.status {
                         CommandStatus::Complete => return aggregation.complete(task_id),
                         CommandStatus::Stuck => {
@@ -200,12 +209,16 @@ impl RunOrchestrator {
                     aggregation.cycles = aggregation.cycles.max(next_cycle.saturating_sub(1));
 
                     if next_cycle > cap {
+                        let ticket = selection.ticket.ticket();
                         return aggregation.stuck(
                             task_id,
                             Some(&ticket_id),
                             format!(
-                                "task {} remains stuck after {} supervised cycles",
-                                task_id, cap
+                                "task {} remains stuck after {} supervised cycles; latest ticket {}: {}",
+                                task_id,
+                                cap,
+                                ticket_id,
+                                ticket_detail(ticket)
                             ),
                         );
                     }
@@ -347,6 +360,8 @@ struct SupervisorAggregation<'a> {
     run_ids: Vec<String>,
     resolved_tickets: Vec<String>,
     resolution_ids: Vec<String>,
+    worker_output: Option<String>,
+    terminal_ticket_id: Option<String>,
     progress_sink: Option<&'a mut dyn OutputSink>,
 }
 
@@ -365,6 +380,8 @@ impl<'a> SupervisorAggregation<'a> {
             run_ids: Vec::new(),
             resolved_tickets: Vec::new(),
             resolution_ids: Vec::new(),
+            worker_output: None,
+            terminal_ticket_id: None,
             progress_sink,
         }
     }
@@ -399,22 +416,29 @@ impl<'a> SupervisorAggregation<'a> {
         push_unique(&mut self.resolution_ids, resolution.id.as_str());
     }
 
+    fn record_worker_output(&mut self, output: Option<String>) {
+        if let Some(output) = output {
+            self.worker_output = Some(output);
+        }
+    }
+
     fn complete(mut self, task_id: &TaskId) -> HarnessResult<CommandResult> {
+        let mut message = format!("task {} complete after supervision", task_id);
+        if let Some(output) = &self.worker_output {
+            message.push_str(": ");
+            message.push_str(output);
+        }
         self.push(progress(
             SuperviseProgressPhase::Complete,
             task_id,
             None,
             None,
             Some(self.cycles),
-            format!("task {} complete after supervision", task_id),
+            message.clone(),
             None,
         ))?;
         Ok(self.result(
-            CommandExit::new(
-                CommandStatus::Complete,
-                0,
-                Some(format!("task {} complete after supervision", task_id)),
-            ),
+            CommandExit::new(CommandStatus::Complete, 0, Some(message)),
             Vec::new(),
         ))
     }
@@ -425,6 +449,7 @@ impl<'a> SupervisorAggregation<'a> {
         ticket_id: Option<&TicketId>,
         message: String,
     ) -> HarnessResult<CommandResult> {
+        self.terminal_ticket_id = ticket_id.map(|ticket_id| ticket_id.as_str().to_string());
         self.push(progress(
             SuperviseProgressPhase::Stuck,
             task_id,
@@ -508,6 +533,7 @@ impl<'a> SupervisorAggregation<'a> {
                 "resolved_tickets": self.resolved_tickets,
                 "resolution_ids": self.resolution_ids,
                 "run_ids": self.run_ids,
+                "ticket_id": self.terminal_ticket_id,
                 "progress_events": self.progress_events.iter().map(progress_json).collect::<Vec<_>>(),
                 "next_commands": next_commands,
             }),
@@ -597,6 +623,59 @@ fn progress(
     }
 }
 
+fn worker_output(result: &CommandResult, store: &dyn TaskStore) -> HarnessResult<Option<String>> {
+    let Some(run_id) = result
+        .data
+        .get("run_id")
+        .and_then(Value::as_str)
+        .and_then(|run_id| RunId::parse(run_id).ok())
+    else {
+        return Ok(None);
+    };
+    let attempts = store.list_attempts(&run_id)?;
+    let Some(attempt) = attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.provider == "ollama" && attempt.response_path.is_some())
+    else {
+        return Ok(None);
+    };
+    let Some(response_path) = &attempt.response_path else {
+        return Ok(None);
+    };
+    let response = fs::read_to_string(response_path).unwrap_or_else(|error| {
+        format!(
+            "unable to read persisted Ollama response {}: {error}",
+            response_path
+        )
+    });
+    let excerpt = response_excerpt(&response);
+    Ok(Some(format!(
+        "local Ollama {} returned {} on attempt {}: {}",
+        attempt.model, attempt.status, attempt.attempt_number, excerpt
+    )))
+}
+
+fn response_excerpt(response: &str) -> String {
+    const MAX_CHARS: usize = 80;
+
+    let mut parts = response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(1)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if parts.is_empty() {
+        parts.push_str("[empty response]");
+    }
+    let mut excerpt = parts.chars().take(MAX_CHARS).collect::<String>();
+    if response.chars().count() > excerpt.chars().count() {
+        excerpt.push_str(" [truncated]");
+    }
+    excerpt
+}
+
 fn command_event(event: &SuperviseProgressEvent) -> CommandEvent {
     let level = match event.phase {
         SuperviseProgressPhase::Failed
@@ -627,6 +706,29 @@ fn next_for_ticket(task_id: &TaskId, ticket_id: &TicketId) -> Vec<String> {
         ),
         format!("harness supervise {} --output json", task_id),
     ]
+}
+
+fn ticket_detail(ticket: &crate::domain::Ticket) -> String {
+    let reason = compact_one_line(&ticket.reason, 140);
+    let question = compact_one_line(&ticket.question, 100);
+    if question.is_empty() {
+        format!("{}: {}", ticket.blocked_on, reason)
+    } else {
+        format!("{}: {}; question: {}", ticket.blocked_on, reason, question)
+    }
+}
+
+fn compact_one_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut output = compact
+        .chars()
+        .take(max_chars.saturating_sub(12))
+        .collect::<String>();
+    output.push_str(" [truncated]");
+    output
 }
 
 fn push_unique(items: &mut Vec<String>, item: &str) {
@@ -853,6 +955,36 @@ mod tests {
             .unwrap();
         assert_eq!(latest.status, RunStatus::Stuck);
         assert_eq!(latest.escalation_cycle, 1);
+    }
+
+    #[test]
+    fn explicit_cycle_budget_can_exceed_configured_default() {
+        let fixture = Fixture::new(1, 300);
+        let task = fixture.task();
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: first\nquestion: What next?");
+        fixture.openai.push_text("Try once.");
+        fixture
+            .ollama
+            .push_text("STUCK\nreason: second\nquestion: What next?");
+        fixture.openai.push_text("Try twice.");
+        fixture.ollama.push_text(diff_response());
+
+        let result = fixture
+            .orchestrator
+            .supervise_task(
+                &task.id,
+                SuperviseTaskOptions {
+                    max_cycles: Some(3),
+                    ..SuperviseTaskOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.exit.status, CommandStatus::Complete);
+        assert_eq!(fixture.openai.requests().len(), 2);
+        assert_eq!(result.data["resolved_tickets"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -1282,6 +1414,14 @@ mod tests {
                 },
                 stderr: String::new(),
             })
+        }
+
+        fn commit_all(&self, _worktree_path: &str, _message: &str) -> HarnessResult<String> {
+            Ok("head".to_string())
+        }
+
+        fn fast_forward_repo(&self, _repo_root: &str, _branch: &str) -> HarnessResult<String> {
+            Ok("merged".to_string())
         }
 
         fn cleanup_task_worktree(&self, _task_id: &TaskId, _force: bool) -> HarnessResult<()> {

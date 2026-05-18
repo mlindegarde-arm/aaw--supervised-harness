@@ -31,6 +31,7 @@ pub struct PatchValidationConfig {
 pub struct PatchValidation {
     pub files_changed: Vec<String>,
     pub patch_bytes: u64,
+    pub normalized_diff: String,
     pub apply_check: GitApplyInvocation,
     pub apply: GitApplyInvocation,
 }
@@ -52,8 +53,16 @@ struct FilePatch {
     renamed: bool,
     binary: bool,
     mode_only: bool,
+    creation_index: bool,
     old_mode: Option<String>,
     new_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HunkHeader<'a> {
+    old_start: u32,
+    new_start: u32,
+    suffix: &'a str,
 }
 
 pub fn parse_ollama_response(text: &str) -> HarnessResult<OllamaResponse> {
@@ -94,9 +103,12 @@ pub fn parse_diff_response(trimmed: &str) -> HarnessResult<ParsedPatch> {
 
 pub fn parse_stuck_response(trimmed: &str) -> HarnessResult<StuckResponse> {
     let lines = trimmed.lines().collect::<Vec<_>>();
+    if lines.len() == 1 {
+        return parse_inline_stuck_response(trimmed);
+    }
     if lines.len() != 3 {
         return Err(parse_error(
-            "STUCK response must contain exactly three lines",
+            "STUCK response must be one inline STUCK block or exactly three lines",
         ));
     }
     if lines[0] != "STUCK" {
@@ -105,6 +117,40 @@ pub fn parse_stuck_response(trimmed: &str) -> HarnessResult<StuckResponse> {
     let reason = parse_stuck_field(lines[1], "reason")?;
     let question = parse_stuck_field(lines[2], "question")?;
     Ok(StuckResponse { reason, question })
+}
+
+fn parse_inline_stuck_response(line: &str) -> HarnessResult<StuckResponse> {
+    let rest = line
+        .strip_prefix("STUCK,")
+        .or_else(|| line.strip_prefix("STUCK "))
+        .ok_or_else(|| parse_error("inline STUCK response must start with STUCK,"))?
+        .trim();
+    let reason_start = rest
+        .find("reason:")
+        .ok_or_else(|| parse_error("missing STUCK field reason"))?;
+    let after_reason = rest[reason_start + "reason:".len()..].trim();
+    let (reason, question) = if let Some(question_start) = after_reason.find("question:") {
+        let reason = after_reason[..question_start]
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        let question = after_reason[question_start + "question:".len()..]
+            .trim()
+            .trim_start_matches(',')
+            .trim();
+        (reason, question)
+    } else {
+        (
+            after_reason.trim_end_matches(',').trim(),
+            "How should this task continue?",
+        )
+    };
+    validate_stuck_value(reason, "reason")?;
+    validate_stuck_value(question, "question")?;
+    Ok(StuckResponse {
+        reason: reason.to_string(),
+        question: question.to_string(),
+    })
 }
 
 pub fn validate_patch_safety(
@@ -147,20 +193,121 @@ pub fn validate_patch_safety(
     }
 
     let files_changed = changed.into_iter().collect::<Vec<_>>();
+    let normalized_diff = normalize_hunk_counts(diff);
     Ok(PatchValidation {
         files_changed,
         patch_bytes,
+        normalized_diff,
         apply_check: GitApplyInvocation {
             program: "git".to_string(),
-            args: vec!["apply".to_string(), "--check".to_string(), "-".to_string()],
+            args: vec![
+                "apply".to_string(),
+                "--check".to_string(),
+                "--recount".to_string(),
+                "-".to_string(),
+            ],
             cwd: worktree.to_string_lossy().into_owned(),
         },
         apply: GitApplyInvocation {
             program: "git".to_string(),
-            args: vec!["apply".to_string(), "-".to_string()],
+            args: vec![
+                "apply".to_string(),
+                "--recount".to_string(),
+                "-".to_string(),
+            ],
             cwd: worktree.to_string_lossy().into_owned(),
         },
     })
+}
+
+pub fn normalize_hunk_counts(diff: &str) -> String {
+    let diff = normalize_new_file_headers(diff);
+    let lines = diff.lines().collect::<Vec<_>>();
+    let mut normalized = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(header) = parse_hunk_header(lines[index]) else {
+            normalized.push(lines[index].to_string());
+            index += 1;
+            continue;
+        };
+
+        let mut old_count = 0_u32;
+        let mut new_count = 0_u32;
+        let mut body = Vec::new();
+        index += 1;
+        while index < lines.len()
+            && !lines[index].starts_with("diff --git ")
+            && parse_hunk_header(lines[index]).is_none()
+        {
+            let line = lines[index];
+            match line.as_bytes().first().copied() {
+                Some(b' ') => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Some(b'-') => old_count += 1,
+                Some(b'+') => new_count += 1,
+                _ => {}
+            }
+            body.push(line.to_string());
+            index += 1;
+        }
+
+        normalized.push(format!(
+            "@@ -{},{} +{},{} @@{}",
+            header.old_start, old_count, header.new_start, new_count, header.suffix
+        ));
+        normalized.extend(body);
+    }
+
+    let mut output = normalized.join("\n");
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn normalize_new_file_headers(diff: &str) -> String {
+    let lines = diff.lines().collect::<Vec<_>>();
+    let mut normalized = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        if !lines[index].starts_with("diff --git ") {
+            normalized.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < lines.len() && !lines[index].starts_with("diff --git ") {
+            index += 1;
+        }
+        let section = &lines[start..index];
+        let is_new_file = section.iter().any(|line| *line == "--- /dev/null")
+            || section
+                .iter()
+                .any(|line| line.starts_with("index 0000000.."));
+        let has_new_file_mode = section
+            .iter()
+            .any(|line| line.starts_with("new file mode "));
+
+        normalized.push(section[0].to_string());
+        if is_new_file && !has_new_file_mode {
+            normalized.push("new file mode 100644".to_string());
+        }
+        normalized.extend(section.iter().skip(1).map(|line| {
+            if is_new_file && line.starts_with("--- ") && *line != "--- /dev/null" {
+                "--- /dev/null".to_string()
+            } else {
+                line.to_string()
+            }
+        }));
+    }
+
+    normalized.join("\n")
 }
 
 fn parse_stuck_field(line: &str, field: &'static str) -> HarnessResult<String> {
@@ -168,6 +315,11 @@ fn parse_stuck_field(line: &str, field: &'static str) -> HarnessResult<String> {
     let Some(value) = line.strip_prefix(&prefix) else {
         return Err(parse_error(format!("missing STUCK field {field}")));
     };
+    validate_stuck_value(value, field)?;
+    Ok(value.to_string())
+}
+
+fn validate_stuck_value(value: &str, field: &'static str) -> HarnessResult<()> {
     if value.is_empty() {
         return Err(parse_error(format!("STUCK field {field} cannot be empty")));
     }
@@ -176,7 +328,7 @@ fn parse_stuck_field(line: &str, field: &'static str) -> HarnessResult<String> {
             "STUCK field {field} exceeds 1000 chars"
         )));
     }
-    Ok(value.to_string())
+    Ok(())
 }
 
 fn parse_file_patches(diff: &str) -> HarnessResult<Vec<FilePatch>> {
@@ -198,6 +350,7 @@ fn parse_file_patches(diff: &str) -> HarnessResult<Vec<FilePatch>> {
                 renamed: false,
                 binary: false,
                 mode_only: false,
+                creation_index: false,
                 old_mode: None,
                 new_mode: None,
             });
@@ -236,6 +389,9 @@ fn parse_file_patches(diff: &str) -> HarnessResult<Vec<FilePatch>> {
             {
                 file.binary = true;
             }
+            value if value.starts_with("index 0000000..") => {
+                file.creation_index = true;
+            }
             value if value.starts_with("--- ") => {
                 file.old_path = parse_patch_side_path(value.strip_prefix("--- ").unwrap(), "a/")?;
                 if file.old_path.is_none() {
@@ -260,7 +416,11 @@ fn parse_file_patches(diff: &str) -> HarnessResult<Vec<FilePatch>> {
     Ok(files)
 }
 
-fn finalize_file_patch(file: FilePatch) -> HarnessResult<FilePatch> {
+fn finalize_file_patch(mut file: FilePatch) -> HarnessResult<FilePatch> {
+    if file.creation_index && !file.deleted {
+        file.old_path = None;
+        file.new_file = true;
+    }
     if file.binary {
         return Ok(file);
     }
@@ -360,6 +520,28 @@ fn parse_quoted_git_path(input: &str) -> HarnessResult<(String, &str)> {
     }
 
     Err(parse_error("unterminated quoted git path"))
+}
+
+fn parse_hunk_header(line: &str) -> Option<HunkHeader<'_>> {
+    let rest = line.strip_prefix("@@ ")?;
+    let (ranges, suffix) = rest.split_once("@@")?;
+    let mut parts = ranges.split_whitespace();
+    let old_range = parts.next()?;
+    let new_range = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(HunkHeader {
+        old_start: parse_hunk_start(old_range, '-')?,
+        new_start: parse_hunk_start(new_range, '+')?,
+        suffix,
+    })
+}
+
+fn parse_hunk_start(range: &str, sign: char) -> Option<u32> {
+    let value = range.strip_prefix(sign)?;
+    let start = value.split_once(',').map_or(value, |(start, _)| start);
+    start.parse().ok()
 }
 
 fn validate_file_patch(file: &FilePatch, worktree: &Path) -> HarnessResult<()> {
@@ -490,16 +672,22 @@ fn ensure_path_stays_in_worktree(
 }
 
 fn canonicalize_existing_parent(full_path: &Path) -> HarnessResult<PathBuf> {
-    let Some(parent) = full_path.parent() else {
-        return Err(security_error("patch path has no parent"));
-    };
-    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
-        HarnessError::External(format!(
-            "failed to canonicalize patch parent {}: {error}",
-            parent.display()
-        ))
-    })?;
-    Ok(canonical_parent)
+    let mut current = full_path.parent();
+    while let Some(parent) = current {
+        if parent.exists() {
+            return fs::canonicalize(parent).map_err(|error| {
+                HarnessError::External(format!(
+                    "failed to canonicalize patch parent {}: {error}",
+                    parent.display()
+                ))
+            });
+        }
+        current = parent.parent();
+    }
+    Err(security_error(format!(
+        "patch path {} has no existing parent",
+        full_path.display()
+    )))
 }
 
 fn is_special_mode(mode: Option<&str>) -> bool {
@@ -549,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn patch_parser_accepts_documented_inline_stuck_block() {
+        let response = parse_ollama_response(
+            "STUCK, reason: no existing crate, question: should I create Cargo.toml?",
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            OllamaResponse::Stuck(StuckResponse {
+                reason: "no existing crate".to_string(),
+                question: "should I create Cargo.toml?".to_string()
+            })
+        );
+
+        let response = parse_ollama_response("STUCK, reason: no existing crate").unwrap();
+        assert_eq!(
+            response,
+            OllamaResponse::Stuck(StuckResponse {
+                reason: "no existing crate".to_string(),
+                question: "How should this task continue?".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn patch_parser_rejects_prose_multiple_nested_and_non_diff_fences() {
         assert!(parse_ollama_response("Here:\n```diff\nx\n```").is_err());
         assert!(parse_ollama_response("```diff\nx\n```\nmore").is_err());
@@ -576,8 +788,59 @@ mod tests {
 
         let validation = validate_patch_safety(diff, &config(temp.path())).unwrap();
         assert_eq!(validation.files_changed, vec!["new.rs", "src.rs"]);
-        assert_eq!(validation.apply_check.args, ["apply", "--check", "-"]);
-        assert_eq!(validation.apply.args, ["apply", "-"]);
+        assert_eq!(
+            validation.apply_check.args,
+            ["apply", "--check", "--recount", "-"]
+        );
+        assert_eq!(validation.apply.args, ["apply", "--recount", "-"]);
+    }
+
+    #[test]
+    fn patch_safety_allows_new_file_inside_new_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let diff = "diff --git a/src/main.rs b/src/main.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/main.rs\n@@ -0,0 +1,3 @@\n+fn main() {\n+    println!(\"Hello, world!\");\n+}\n";
+
+        let validation = validate_patch_safety(diff, &config(temp.path())).unwrap();
+
+        assert_eq!(validation.files_changed, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn patch_safety_normalizes_generated_hunk_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let diff = "diff --git a/Cargo.toml b/Cargo.toml\nnew file mode 100644\n--- /dev/null\n+++ b/Cargo.toml\n@@ -0,0 +1,8 @@\n+[package]\n+name = \"hello_world\"\n+version = \"0.1.0\"\n+edition = \"2021\"\n+\n+[dependencies]\n+\n+[profile.release]\n+opt-level = 3\ndiff --git a/src/main.rs b/src/main.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/main.rs\n@@ -0,0 +1,3 @@\n+fn main() {\n+    println!(\"Hello, world!\");\n+}\n";
+
+        let validation = validate_patch_safety(diff, &config(temp.path())).unwrap();
+
+        assert!(validation.normalized_diff.contains("@@ -0,0 +1,9 @@"));
+        assert!(validation.normalized_diff.contains("@@ -0,0 +1,3 @@"));
+        assert!(validation.normalized_diff.ends_with('\n'));
+    }
+
+    #[test]
+    fn patch_safety_adds_omitted_new_file_mode_for_dev_null_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let diff = "diff --git a/Cargo.toml b/Cargo.toml\nindex 0000000..1234567 100644\n--- /dev/null\n+++ b/Cargo.toml\n@@ -0,0 +1,3 @@\n+[package]\n+name = \"hello_world\"\n+version = \"0.1.0\"\n";
+
+        let validation = validate_patch_safety(diff, &config(temp.path())).unwrap();
+
+        assert!(
+            validation
+                .normalized_diff
+                .contains("diff --git a/Cargo.toml b/Cargo.toml\nnew file mode 100644\nindex")
+        );
+    }
+
+    #[test]
+    fn patch_safety_treats_zero_index_patch_as_new_file_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let diff = "diff --git a/Cargo.toml b/Cargo.toml\nindex 0000000..1234567 100644\n--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -0,0 +1,3 @@\n+[package]\n+name = \"hello_world\"\n+version = \"0.1.0\"\n";
+
+        let validation = validate_patch_safety(diff, &config(temp.path())).unwrap();
+
+        assert!(validation.normalized_diff.contains(
+            "diff --git a/Cargo.toml b/Cargo.toml\nnew file mode 100644\nindex 0000000..1234567 100644\n--- /dev/null"
+        ));
     }
 
     #[test]

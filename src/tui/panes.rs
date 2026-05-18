@@ -999,7 +999,7 @@ mod tests {
         snapshot.apply_objective_progress(&objective_event(
             ObjectiveProgressKind::TicketResolutionStarted,
             ObjectiveProgressPhase::Resolving,
-            "remote resolver running",
+            "remote resolver running with diagnosis",
             Some(task_id),
             Some(ticket_id),
         ));
@@ -1018,6 +1018,9 @@ mod tests {
         );
         assert!(
             matches!(&objective.tickets, PaneSection::Ready(rows) if rows[0].status == "resolving")
+        );
+        assert!(
+            matches!(&objective.tickets, PaneSection::Ready(rows) if rows[0].detail.contains("diagnosis"))
         );
         assert!(
             matches!(&objective.validation, PaneSection::Ready(rows) if rows[0].status == "passed")

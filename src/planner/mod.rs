@@ -1023,6 +1023,17 @@ mod tests {
         assert!(parse_planner_response_for_repo(&valid_planner_json(), temp.path()).is_ok());
     }
 
+    #[test]
+    fn planner_output_accepts_dot_as_whole_repo_owned_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut value = planner_value();
+        value["tasks"][0]["owned_paths"] = serde_json::json!(["."]);
+
+        let parsed = parse_planner_response_for_repo(&value.to_string(), temp.path()).unwrap();
+
+        assert_eq!(parsed.tasks[0].owned_paths, vec!["."]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn planner_repo_validation_rejects_symlink_escapes() {

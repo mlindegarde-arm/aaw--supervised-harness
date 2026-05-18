@@ -348,7 +348,7 @@ fn foreground_supervise_streams_progress_and_reenables_composer() {
     assert!(running.text.contains("running"), "{}", running.text);
 
     let finished = tui
-        .wait_for_text("command finished: complete", Duration::from_secs(20))
+        .wait_for_text("complete after supervision", Duration::from_secs(20))
         .unwrap();
     assert!(
         finished.text.contains("RunTask") || finished.text.contains("running task"),
@@ -505,17 +505,22 @@ fn side_pane_switching_and_transcript_scrolling_work_under_pty() {
     tui.type_text("!i=1; while [ $i -le 36 ]; do printf 'scroll_%02d\\n' $i; i=$((i+1)); done")
         .unwrap();
     tui.press_enter().unwrap();
-    let bottom = tui.wait_for_text("scroll_18", MEDIUM).unwrap();
-    assert!(!bottom.text.contains("scroll_30"), "{}", bottom.text);
+    let bottom = tui
+        .wait_for_text("command finished: complete (0)", MEDIUM)
+        .unwrap();
+    assert!(bottom.text.contains("scroll_36"), "{}", bottom.text);
+    assert!(!bottom.text.contains("scroll_12"), "{}", bottom.text);
 
     tui.press_page_up().unwrap();
     tui.press_page_up().unwrap();
-    let scrolled = tui.wait_for_text("scroll_30", SHORT).unwrap();
-    assert!(scrolled.text.contains("scroll_30"), "{}", scrolled.text);
+    let scrolled = tui.wait_for_text("scroll_12", SHORT).unwrap();
+    assert!(scrolled.text.contains("scroll_12"), "{}", scrolled.text);
+    assert!(!scrolled.text.contains("scroll_36"), "{}", scrolled.text);
 
     tui.press_page_down().unwrap();
-    let restored = tui.wait_for_absence("scroll_30", SHORT).unwrap();
-    assert!(!restored.text.contains("scroll_30"), "{}", restored.text);
+    tui.press_page_down().unwrap();
+    let restored = tui.wait_for_absence("scroll_12", SHORT).unwrap();
+    assert!(restored.text.contains("scroll_36"), "{}", restored.text);
 
     tui.press_ctrl_d().unwrap();
     assert_terminal_cleanup(&tui.wait_for_exit(SHORT).unwrap());

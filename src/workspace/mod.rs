@@ -102,6 +102,8 @@ pub trait WorkspaceManager {
     fn capture_diff(&self, worktree_path: &str, run_id: &RunId) -> HarnessResult<String>;
     fn check_patch(&self, patch: PatchCheck) -> HarnessResult<PatchCheckResult>;
     fn apply_patch(&self, patch: PatchCheck) -> HarnessResult<PatchApplyResult>;
+    fn commit_all(&self, worktree_path: &str, message: &str) -> HarnessResult<String>;
+    fn fast_forward_repo(&self, repo_root: &str, branch: &str) -> HarnessResult<String>;
     fn cleanup_task_worktree(&self, task_id: &TaskId, force: bool) -> HarnessResult<()>;
 }
 
@@ -229,6 +231,7 @@ impl WorkspaceManager for GitWorkspaceManager {
 
         fs::create_dir_all(&worktree_root).map_err(io_error("create worktree root"))?;
         let base_ref = request.base_ref.unwrap_or_else(|| "HEAD".to_string());
+        ensure_default_base_ref_exists(&repo_root, &base_ref)?;
         let base_commit = resolve_commit(&repo_root, &base_ref)?;
         let branch = expected_branch;
 
@@ -311,7 +314,7 @@ impl WorkspaceManager for GitWorkspaceManager {
             &validation.apply_check.program,
             &validation.apply_check.args,
             Path::new(&validation.apply_check.cwd),
-            &patch.diff,
+            &validation.normalized_diff,
         )?;
         Ok(PatchCheckResult {
             files_changed: validation.files_changed,
@@ -325,7 +328,7 @@ impl WorkspaceManager for GitWorkspaceManager {
             &validation.apply.program,
             &validation.apply.args,
             Path::new(&validation.apply.cwd),
-            &patch.diff,
+            &validation.normalized_diff,
         )?;
         Ok(PatchApplyResult {
             check: PatchCheckResult {
@@ -334,6 +337,37 @@ impl WorkspaceManager for GitWorkspaceManager {
             },
             stderr,
         })
+    }
+
+    fn commit_all(&self, worktree_path: &str, message: &str) -> HarnessResult<String> {
+        let worktree_path = Path::new(worktree_path);
+        git_output(["add", "-A", "--", "."], worktree_path)?;
+        if worktree_path.join("target").exists() {
+            let _ = git_output(["reset", "-q", "--", "target"], worktree_path);
+        }
+        if git_status_success(["diff", "--cached", "--quiet"], worktree_path)? {
+            return resolve_commit(worktree_path, "HEAD");
+        }
+        git_output(
+            [
+                "-c",
+                "user.name=harness",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+            worktree_path,
+        )?;
+        resolve_commit(worktree_path, "HEAD")
+    }
+
+    fn fast_forward_repo(&self, repo_root: &str, branch: &str) -> HarnessResult<String> {
+        let repo_root = Path::new(repo_root);
+        git_output(["merge", "--ff-only", branch], repo_root)?;
+        resolve_commit(repo_root, "HEAD")
     }
 
     fn cleanup_task_worktree(&self, task_id: &TaskId, force: bool) -> HarnessResult<()> {
@@ -404,6 +438,37 @@ fn resolve_commit(repo_root: &Path, reference: &str) -> HarnessResult<String> {
     )
 }
 
+fn ensure_default_base_ref_exists(repo_root: &Path, base_ref: &str) -> HarnessResult<()> {
+    if base_ref != "HEAD" || git_ref_exists(repo_root, "HEAD^{commit}")? {
+        return Ok(());
+    }
+    if !git_status_success(["diff", "--cached", "--quiet"], repo_root)? {
+        return Err(HarnessError::Conflict(
+            "cannot initialize empty repository for harness worktree: index has staged changes"
+                .to_string(),
+        ));
+    }
+    git_output(
+        [
+            "-c",
+            "user.name=harness",
+            "-c",
+            "user.email=harness@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            "Initialize harness repository",
+        ],
+        repo_root,
+    )?;
+    Ok(())
+}
+
+fn git_ref_exists(repo_root: &Path, reference: &str) -> HarnessResult<bool> {
+    git_status_success(["rev-parse", "--verify", reference], repo_root)
+}
+
 fn git_output<const N: usize>(args: [&str; N], cwd: &Path) -> HarnessResult<String> {
     let output = Command::new("git")
         .args(args)
@@ -423,6 +488,18 @@ fn git_output<const N: usize>(args: [&str; N], cwd: &Path) -> HarnessResult<Stri
             stderr.trim()
         )))
     }
+}
+
+fn git_status_success<const N: usize>(args: [&str; N], cwd: &Path) -> HarnessResult<bool> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| HarnessError::External(format!("spawn git: {err}")))?;
+    Ok(status.success())
 }
 
 fn command_stdin(program: &str, args: &[String], cwd: &Path, stdin: &str) -> HarnessResult<String> {
@@ -917,6 +994,32 @@ mod tests {
     }
 
     #[test]
+    fn creates_worktree_from_empty_repo_by_bootstrapping_head() {
+        let repo = empty_test_repo();
+        fs::create_dir_all(repo.path().join(".harness")).unwrap();
+        let manager = manager_for(&repo);
+        let task_id = TaskId::parse(TASK_ID).unwrap();
+
+        let info = manager
+            .ensure_task_worktree(WorktreeRequest {
+                repo_root: path_to_string(repo.path()),
+                worktree_root: path_to_string(manager.worktree_root()),
+                task_id: task_id.clone(),
+                base_ref: None,
+                recorded: None,
+            })
+            .unwrap();
+
+        let repo_head = manager
+            .resolve_base_commit(repo.path().to_str().unwrap(), Some("HEAD"))
+            .unwrap();
+        assert_eq!(info.base_commit, repo_head);
+        assert_eq!(info.head, repo_head);
+        assert!(!Path::new(&info.path).join(".harness").exists());
+        manager.cleanup_task_worktree(&task_id, false).unwrap();
+    }
+
+    #[test]
     fn recorded_reuse_requires_task_branch() {
         let repo = test_repo();
         let manager = manager_for(&repo);
@@ -1226,8 +1329,7 @@ mod tests {
     }
 
     fn test_repo() -> TempDir {
-        let temp = TempDir::new().unwrap();
-        run_git(temp.path(), ["init", "-b", "main"]);
+        let temp = empty_test_repo();
         fs::write(temp.path().join("file.txt"), "initial\n").unwrap();
         run_git(temp.path(), ["add", "."]);
         run_git(
@@ -1242,6 +1344,12 @@ mod tests {
                 "initial",
             ],
         );
+        temp
+    }
+
+    fn empty_test_repo() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        run_git(temp.path(), ["init", "-b", "main"]);
         temp
     }
 

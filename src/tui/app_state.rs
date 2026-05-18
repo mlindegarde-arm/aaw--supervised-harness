@@ -170,7 +170,7 @@ impl TuiAppState {
                 self.append_transcript_event(TranscriptEvent::Stderr(text));
             }
             TuiRuntimeEvent::Progress(progress) => {
-                self.header.phase = format!("{:?}", progress.phase);
+                self.header.phase = progress.phase.as_str().to_string();
                 self.header.active_task = progress.task_id.as_ref().map(ToString::to_string);
                 self.header.active_run = progress.run_id.as_ref().map(ToString::to_string);
                 self.append_transcript_event(TranscriptEvent::SuperviseProgress(progress));
@@ -181,10 +181,6 @@ impl TuiAppState {
             }
             TuiRuntimeEvent::CommandFinished(result) => {
                 self.set_activity(CommandActivity::Idle);
-                for event in result.events {
-                    self.apply_command_event(&event);
-                    self.append_transcript_event(TranscriptEvent::Command(event));
-                }
                 self.append_transcript_event(TranscriptEvent::CommandFinished(result.exit));
                 self.panes.mark_stale();
             }

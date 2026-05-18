@@ -15,7 +15,7 @@ const HEADER_HEIGHT: u16 = 1;
 const COMPOSER_HEIGHT: u16 = 10;
 const FOOTER_HEIGHT: u16 = 1;
 const WIDE_MIN_WIDTH: u16 = 100;
-const SIDE_PANE_WIDTH: u16 = 38;
+const SIDE_PANE_WIDTH: u16 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -84,7 +84,12 @@ pub fn render_app(frame: &mut Frame<'_>, app: &TuiAppState) {
 
     frame.render_widget(render_header(app, &theme), layout.header);
     frame.render_widget(
-        render_transcript(app, &theme, app.focus == TuiFocus::Transcript),
+        render_transcript(
+            app,
+            &theme,
+            app.focus == TuiFocus::Transcript,
+            layout.transcript,
+        ),
         layout.transcript,
     );
     let mut side_pane_state =
@@ -280,8 +285,13 @@ fn suggestion_line<'a>(row: &'a SuggestionRow, theme: &TuiTheme) -> Line<'a> {
     ])
 }
 
-fn render_transcript<'a>(app: &'a TuiAppState, theme: &TuiTheme, focused: bool) -> Paragraph<'a> {
-    let lines = if app.transcript.is_empty() {
+fn render_transcript<'a>(
+    app: &'a TuiAppState,
+    theme: &TuiTheme,
+    focused: bool,
+    area: Rect,
+) -> Paragraph<'a> {
+    let all_lines = if app.transcript.is_empty() {
         vec![Line::styled("No activity yet", theme.muted)]
     } else {
         app.transcript
@@ -289,10 +299,20 @@ fn render_transcript<'a>(app: &'a TuiAppState, theme: &TuiTheme, focused: bool) 
             .flat_map(|entry| transcript_entry_lines(entry, theme))
             .collect()
     };
+    let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let total = all_lines.len();
+    let scroll = usize::from(app.transcript.scroll_from_bottom());
+    let start = total.saturating_sub(visible_height.saturating_add(scroll));
+    let end = total.saturating_sub(scroll).max(start).min(total);
+    let lines = all_lines
+        .into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect::<Vec<_>>();
     let block = focused_block("Transcript", focused, theme);
     Paragraph::new(lines)
         .block(block)
-        .scroll((app.transcript.scroll_from_bottom(), 0))
+        .scroll((0, 0))
         .wrap(Wrap { trim: false })
 }
 
@@ -436,16 +456,24 @@ fn push_objective_section<'a, T>(
         items.push(ListItem::new(Line::styled("  none", theme.muted)));
         return;
     }
-    items.extend(rows.iter().take(4).map(|row| {
-        ListItem::new(Line::from(vec![
+    for row in rows.iter().take(4) {
+        let detail = row.row_detail();
+        let mut lines = vec![Line::from(vec![
             Span::styled(
                 format!("  {:<10}", truncate(row.row_status(), 10)),
                 lifecycle_style(row.row_status(), theme),
             ),
             Span::styled(format!("{:<14}", truncate(row.row_id(), 14)), theme.base),
             Span::styled(truncate(row.row_detail(), 44), theme.muted),
-        ]))
-    }));
+        ])];
+        if detail.chars().count() > 44 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(truncate(detail, 72), theme.muted),
+            ]));
+        }
+        items.push(ListItem::new(lines));
+    }
 }
 
 fn push_transcript_section<'a>(
@@ -478,7 +506,7 @@ fn push_transcript_section<'a>(
 fn lifecycle_style(status: &str, theme: &TuiTheme) -> ratatui::style::Style {
     match status {
         "complete" | "passed" | "passing" | "accepted" | "resolved" => theme.stdout,
-        "failed" | "blocked" | "cancelled" | "rejected" | "failing" => theme.stderr,
+        "failed" | "blocked" | "cancelled" | "rejected" | "failing" | "stuck" => theme.stderr,
         "running" | "resolving" | "validating" | "planning" | "resuming" => theme.warning,
         _ => theme.base,
     }
@@ -579,8 +607,8 @@ mod tests {
         let layout = compute_layout(Rect::new(0, 0, 120, 40));
 
         assert_eq!(layout.mode, LayoutMode::Wide);
-        assert_eq!(layout.side_pane.x, 82);
-        assert_eq!(layout.side_pane.width, 38);
+        assert_eq!(layout.side_pane.x, 56);
+        assert_eq!(layout.side_pane.width, 64);
         assert_eq!(layout.transcript.y, layout.side_pane.y);
     }
 
@@ -636,6 +664,25 @@ mod tests {
     }
 
     #[test]
+    fn render_transcript_defaults_to_latest_entries() {
+        let mut app = TuiAppState::default();
+        for idx in 0..30 {
+            app.transcript.append_untrusted_text(
+                crate::tui::transcript::TranscriptSource::System,
+                &format!("entry-{idx:02}"),
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| render_app(frame, &app)).unwrap();
+        let buffer = format!("{:?}", terminal.backend().buffer());
+
+        assert!(buffer.contains("entry-29"));
+        assert!(buffer.contains("entry-28"));
+        assert!(!buffer.contains("entry-00"));
+    }
+
+    #[test]
     fn render_pane_rows_with_selection_marker_style() {
         let mut app = TuiAppState::default();
         app.set_pane_snapshot(snapshot_with_rows());
@@ -671,7 +718,7 @@ mod tests {
         app.panes.apply_objective_progress(&objective_event(
             ObjectiveProgressKind::TicketResolutionStarted,
             ObjectiveProgressPhase::Resolving,
-            "remote resolver running",
+            "remote resolver running: create Cargo.toml and src/main.rs",
             Some(task_id),
             Some(ticket_id),
         ));
@@ -693,6 +740,7 @@ mod tests {
         assert!(buffer.contains("Validation"));
         assert!(buffer.contains("Remote"));
         assert!(buffer.contains("remote resolver running"));
+        assert!(buffer.contains("create"));
     }
 
     #[test]

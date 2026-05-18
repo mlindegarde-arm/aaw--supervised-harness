@@ -362,6 +362,7 @@ Planner-generated objective validation commands are reviewed before execution. T
 ```sh
 cargo test
 cargo check
+cargo build
 cargo fmt --check
 cargo clippy
 go test ./...

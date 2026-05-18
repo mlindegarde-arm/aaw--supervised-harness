@@ -20,12 +20,12 @@ use crate::providers::ModelRequest;
 use crate::runtime::{
     CancellationToken, CommandEvent, CommandEventLevel, CommandExit, CommandResult, CommandStatus,
     ObjectiveProgressKind, ObjectiveProgressPhase, ObjectiveSuperviseOptions,
-    ObjectiveValidateOptions, SuperviseTaskOptions,
+    ObjectiveValidateOptions, OutputSink, SuperviseTaskOptions,
 };
 use crate::security::{ValidationCommandClassification, ValidationCommandPolicy};
 use crate::state::{
     NewGeneratedTask, NewObjectiveResolverAttempt, ObjectiveArtifact, ObjectiveEvent,
-    ObjectiveStatusUpdate, PlannerExchange,
+    ObjectiveStatusUpdate, PlannerExchange, TaskStore,
 };
 use crate::workspace::{CommandOutput, CommandSpec, CommandStdin};
 use std::collections::BTreeMap;
@@ -48,11 +48,40 @@ impl RunOrchestrator {
         options: ObjectiveSuperviseOptions,
         cancellation: &dyn CancellationToken,
     ) -> HarnessResult<CommandResult> {
+        self.supervise_objective_with_cancellation_and_sink(
+            objective_id,
+            options,
+            cancellation,
+            None,
+        )
+    }
+
+    pub fn supervise_objective_streaming(
+        &self,
+        objective_id: &ObjectiveId,
+        options: ObjectiveSuperviseOptions,
+        sink: &mut dyn OutputSink,
+    ) -> HarnessResult<CommandResult> {
+        self.supervise_objective_with_cancellation_and_sink(
+            objective_id,
+            options,
+            &NeverCancelled,
+            Some(sink),
+        )
+    }
+
+    fn supervise_objective_with_cancellation_and_sink(
+        &self,
+        objective_id: &ObjectiveId,
+        options: ObjectiveSuperviseOptions,
+        cancellation: &dyn CancellationToken,
+        sink: Option<&mut dyn OutputSink>,
+    ) -> HarnessResult<CommandResult> {
         let owner = objective_owner(objective_id);
         self.store
             .acquire_objective_monitor_lease(objective_id, &owner)?;
         let result =
-            self.supervise_objective_with_lease(objective_id, options, &owner, cancellation);
+            self.supervise_objective_with_lease(objective_id, options, &owner, cancellation, sink);
         let release = self
             .store
             .release_objective_monitor_lease(objective_id, &owner);
@@ -68,6 +97,7 @@ impl RunOrchestrator {
         options: ObjectiveSuperviseOptions,
         owner: &str,
         cancellation: &dyn CancellationToken,
+        mut sink: Option<&mut dyn OutputSink>,
     ) -> HarnessResult<CommandResult> {
         if cancellation.is_cancelled() {
             return self.cancel_objective_monitor(objective_id);
@@ -96,6 +126,7 @@ impl RunOrchestrator {
             ObjectiveStatus::Running,
             "supervising objective",
         ));
+        stream_new_events(&mut sink, &result.events, 0)?;
 
         self.store.update_objective_status(
             objective_id,
@@ -113,11 +144,31 @@ impl RunOrchestrator {
             }
             self.store
                 .refresh_objective_monitor_lease(objective_id, owner)?;
-            match self.run_one_objective_cycle(objective_id, &options)? {
+            let cycle = match sink.as_mut() {
+                Some(sink) => self.run_one_objective_cycle_streaming(
+                    objective_id,
+                    &options,
+                    Some(&mut **sink),
+                )?,
+                None => self.run_one_objective_cycle_streaming(objective_id, &options, None)?,
+            };
+            match cycle {
                 ObjectiveCycleResult::Progress(events) => {
+                    let skip = if sink.is_some() && starts_with_worker_started(&events) {
+                        1
+                    } else {
+                        0
+                    };
+                    stream_new_events(&mut sink, &events, skip)?;
                     result.events.extend(events);
                 }
                 ObjectiveCycleResult::Terminal(mut terminal) => {
+                    let skip = if sink.is_some() && starts_with_worker_started(&terminal.events) {
+                        1
+                    } else {
+                        0
+                    };
+                    stream_new_events(&mut sink, &terminal.events, skip)?;
                     result.events.extend(std::mem::take(&mut terminal.events));
                     terminal.events = result.events;
                     return Ok(terminal);
@@ -166,6 +217,15 @@ impl RunOrchestrator {
         objective_id: &ObjectiveId,
         options: &ObjectiveSuperviseOptions,
     ) -> HarnessResult<ObjectiveCycleResult> {
+        self.run_one_objective_cycle_streaming(objective_id, options, None)
+    }
+
+    fn run_one_objective_cycle_streaming(
+        &self,
+        objective_id: &ObjectiveId,
+        options: &ObjectiveSuperviseOptions,
+        mut sink: Option<&mut dyn OutputSink>,
+    ) -> HarnessResult<ObjectiveCycleResult> {
         self.recover_expired_objective_task_leases(objective_id)?;
         if let Some(task) = self.store.next_ready_objective_task(objective_id)? {
             let Some(max_attempts) =
@@ -176,37 +236,74 @@ impl RunOrchestrator {
                     format!("generated task {} exhausted worker attempts", task.id),
                 );
             };
-            let mut events = vec![event(
+            let worker_model = options
+                .worker_model
+                .clone()
+                .unwrap_or_else(|| self.config.providers.ollama.default_model.clone());
+            let mut events = vec![task_event(
                 ObjectiveProgressKind::WorkerStarted,
                 objective_id,
+                &task.id,
                 ObjectiveProgressPhase::Running,
                 ObjectiveStatus::Running,
-                format!("running generated task {}", task.id),
+                format!(
+                    "running generated task {} with local Ollama model {}",
+                    task.id, worker_model
+                ),
             )];
-            let supervised = self.supervise_task(
-                &task.id,
-                SuperviseTaskOptions {
-                    runtime: options.runtime.clone(),
-                    ticket_id: None,
-                    max_attempts: Some(limit_worker_attempts(
-                        options.max_worker_attempts,
-                        max_attempts,
-                    )),
-                    model: options.worker_model.clone(),
-                    ticket_model: options.ticket_model.clone(),
-                    max_cycles: Some(0),
-                },
+            self.persist_objective_event(
+                objective_id,
+                ObjectiveProgressKind::WorkerStarted,
+                format!(
+                    "running generated task {} with local Ollama model {}",
+                    task.id, worker_model
+                ),
+                json!({"task_id": task.id.as_str(), "model": worker_model}),
             )?;
+            stream_new_events(&mut sink, &events, 0)?;
+            let supervise_options = SuperviseTaskOptions {
+                runtime: options.runtime.clone(),
+                ticket_id: None,
+                max_attempts: Some(limit_worker_attempts(
+                    options.max_worker_attempts,
+                    max_attempts,
+                )),
+                model: options.worker_model.clone(),
+                ticket_model: options.ticket_model.clone(),
+                max_cycles: Some(0),
+            };
+            let supervised = self.supervise_task(&task.id, supervise_options)?;
             self.record_objective_worker_attempts_from_result(objective_id, &task.id, &supervised)?;
             match supervised.exit.status {
                 CommandStatus::Complete => {
-                    events.push(event(
+                    let completed = self.store.get_task(&task.id)?;
+                    let branch = completed.branch.as_ref().ok_or_else(|| {
+                        HarnessError::Conflict(format!(
+                            "completed objective task {} has no task branch",
+                            completed.id
+                        ))
+                    })?;
+                    self.workspace
+                        .fast_forward_repo(&completed.repo_root, branch)?;
+                    let completed_event = task_event(
                         ObjectiveProgressKind::WorkerCompleted,
                         objective_id,
+                        &task.id,
                         ObjectiveProgressPhase::Running,
                         ObjectiveStatus::Running,
-                        format!("generated task {} completed", task.id),
-                    ));
+                        worker_completed_message(&task, &supervised, self.store.as_ref())?,
+                    );
+                    self.persist_objective_event(
+                        objective_id,
+                        ObjectiveProgressKind::WorkerCompleted,
+                        completed_event
+                            .objective_progress
+                            .as_ref()
+                            .map(|progress| progress.message.clone())
+                            .unwrap_or_else(|| format!("generated task {} completed", task.id)),
+                        json!({"task_id": task.id.as_str()}),
+                    )?;
+                    events.push(completed_event);
                     Ok(ObjectiveCycleResult::Progress(events))
                 }
                 CommandStatus::Stuck => {
@@ -231,9 +328,10 @@ impl RunOrchestrator {
                         objective_id,
                         &task.id,
                         options,
-                        vec![event(
+                        vec![task_event(
                             ObjectiveProgressKind::TicketDetected,
                             objective_id,
+                            &task.id,
                             ObjectiveProgressPhase::Running,
                             ObjectiveStatus::Running,
                             format!("generated task {} is stuck", task.id),
@@ -668,9 +766,7 @@ impl RunOrchestrator {
             base_ref: None,
             base_commit: None,
             last_seen_head: None,
-            max_attempts: options
-                .max_worker_attempts
-                .unwrap_or(self.config.orchestrator.max_attempts),
+            max_attempts: self.effective_objective_worker_attempts(options.max_worker_attempts),
             lease_owner: None,
             lease_acquired_at: None,
             lease_expires_at: None,
@@ -687,9 +783,8 @@ impl RunOrchestrator {
                 parallel_group: Some("acceptance_repair".to_string()),
                 owned_paths_json: "[]".to_string(),
                 sequence: u32::MAX,
-                worker_attempt_budget: options
-                    .max_worker_attempts
-                    .unwrap_or(self.config.orchestrator.max_attempts),
+                worker_attempt_budget: self
+                    .effective_objective_worker_attempts(options.max_worker_attempts),
                 trusted_validation_commands: validations.to_vec(),
                 reviewed_validation_commands: Vec::new(),
             },
@@ -714,17 +809,30 @@ impl RunOrchestrator {
                 ),
             );
         };
-        let ticket_id = selection.ticket.ticket().id.clone();
-        events.push(event(
+        let ticket = selection.ticket.ticket().clone();
+        let ticket_id = ticket.id.clone();
+        let detected_message = ticket_detected_message(task_id, &ticket);
+        events.push(task_ticket_event(
             ObjectiveProgressKind::TicketDetected,
             objective_id,
+            task_id,
+            &ticket_id,
             ObjectiveProgressPhase::Running,
             ObjectiveStatus::Running,
-            format!(
-                "detected ticket {} for generated task {}",
-                ticket_id, task_id
-            ),
+            detected_message.clone(),
         ));
+        self.persist_objective_event(
+            objective_id,
+            ObjectiveProgressKind::TicketDetected,
+            detected_message,
+            json!({
+                "task_id": task_id.as_str(),
+                "ticket_id": ticket_id.as_str(),
+                "blocked_on": ticket.blocked_on,
+                "reason": ticket.reason,
+                "question": ticket.question,
+            }),
+        )?;
 
         if !matches!(
             selection.ticket,
@@ -748,6 +856,24 @@ impl RunOrchestrator {
                 format!("generated task {} exhausted worker attempts", task_id),
             );
         };
+        let resume_message = format!(
+            "resuming generated task {} with local Ollama after ticket {}",
+            task_id, ticket_id
+        );
+        events.push(task_event(
+            ObjectiveProgressKind::WorkerResumed,
+            objective_id,
+            task_id,
+            ObjectiveProgressPhase::Running,
+            ObjectiveStatus::Running,
+            resume_message.clone(),
+        ));
+        self.persist_objective_event(
+            objective_id,
+            ObjectiveProgressKind::WorkerResumed,
+            resume_message,
+            json!({"task_id": task_id.as_str(), "ticket_id": ticket_id.as_str()}),
+        )?;
         let resumed = self.supervise_task(
             task_id,
             SuperviseTaskOptions {
@@ -759,25 +885,16 @@ impl RunOrchestrator {
                 )),
                 model: options.worker_model.clone(),
                 ticket_model: options.ticket_model.clone(),
-                max_cycles: Some(1),
+                max_cycles: Some(selection.stuck_run.next_cycle),
             },
         )?;
         self.record_objective_worker_attempts_from_result(objective_id, task_id, &resumed)?;
-        events.push(event(
-            ObjectiveProgressKind::WorkerResumed,
-            objective_id,
-            ObjectiveProgressPhase::Running,
-            ObjectiveStatus::Running,
-            format!(
-                "resumed generated task {} with ticket {}",
-                task_id, ticket_id
-            ),
-        ));
         match resumed.exit.status {
             CommandStatus::Complete => {
-                events.push(event(
+                events.push(task_event(
                     ObjectiveProgressKind::WorkerCompleted,
                     objective_id,
+                    task_id,
                     ObjectiveProgressPhase::Running,
                     ObjectiveStatus::Running,
                     format!(
@@ -787,13 +904,77 @@ impl RunOrchestrator {
                 ));
                 Ok(ObjectiveCycleResult::Progress(events))
             }
-            CommandStatus::Stuck => self.block_objective(
-                objective_id,
-                format!(
-                    "generated task {} remains stuck after ticket {}",
-                    task_id, ticket_id
-                ),
-            ),
+            CommandStatus::Stuck => {
+                let new_ticket_id = resumed
+                    .data
+                    .get("ticket_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| TicketId::parse(id).ok());
+                if let Some(new_ticket_id) = &new_ticket_id {
+                    if new_ticket_id == &ticket_id {
+                        let repeated = self
+                            .store
+                            .get_ticket(new_ticket_id)
+                            .map(|ticket| ticket_summary(&ticket))
+                            .unwrap_or_else(|_| {
+                                "worker repeated the same unresolved blocker".to_string()
+                            });
+                        let message = format!(
+                            "generated task {} repeated ticket {} after resolution: {}",
+                            task_id, new_ticket_id, repeated
+                        );
+                        return self.block_objective_with_prior_events(
+                            objective_id,
+                            message,
+                            events,
+                        );
+                    }
+                    let detected_message = self
+                        .store
+                        .get_ticket(new_ticket_id)
+                        .map(|ticket| ticket_detected_message(task_id, &ticket))
+                        .unwrap_or_else(|_| {
+                            format!(
+                                "generated task {} opened new ticket {} after resume",
+                                task_id, new_ticket_id
+                            )
+                        });
+                    events.push(task_ticket_event(
+                        ObjectiveProgressKind::TicketDetected,
+                        objective_id,
+                        task_id,
+                        new_ticket_id,
+                        ObjectiveProgressPhase::Running,
+                        ObjectiveStatus::Running,
+                        detected_message.clone(),
+                    ));
+                    self.persist_objective_event(
+                        objective_id,
+                        ObjectiveProgressKind::TicketDetected,
+                        detected_message,
+                        json!({
+                            "task_id": task_id.as_str(),
+                            "ticket_id": new_ticket_id.as_str(),
+                        }),
+                    )?;
+                    return Ok(ObjectiveCycleResult::Progress(events));
+                }
+                let message = match &new_ticket_id {
+                    Some(_) => unreachable!("new ticket returns progress above"),
+                    None => format!(
+                        "generated task {} remains stuck after ticket {}: {}",
+                        task_id,
+                        ticket_id,
+                        resumed
+                            .exit
+                            .message
+                            .as_deref()
+                            .map(|message| compact_one_line(message, 220))
+                            .unwrap_or_else(|| "no worker reason was reported".to_string())
+                    ),
+                };
+                self.block_objective_with_prior_events(objective_id, message, events)
+            }
             _ => self.fail_objective(
                 objective_id,
                 format!(
@@ -803,6 +984,22 @@ impl RunOrchestrator {
                 resumed.exit,
             ),
         }
+    }
+
+    fn block_objective_with_prior_events(
+        &self,
+        objective_id: &ObjectiveId,
+        reason: String,
+        mut prior_events: Vec<CommandEvent>,
+    ) -> HarnessResult<ObjectiveCycleResult> {
+        let ObjectiveCycleResult::Terminal(mut terminal) =
+            self.block_objective(objective_id, reason)?
+        else {
+            unreachable!("block_objective always returns a terminal result");
+        };
+        prior_events.extend(std::mem::take(&mut terminal.events));
+        terminal.events = prior_events;
+        Ok(ObjectiveCycleResult::Terminal(terminal))
     }
 
     fn record_objective_worker_attempts_from_result(
@@ -877,9 +1074,11 @@ impl RunOrchestrator {
         let attempt = self
             .store
             .acquire_resolver_attempt_lease(&attempt.id, &owner)?;
-        let mut events = vec![event(
+        let mut events = vec![task_ticket_event(
             ObjectiveProgressKind::TicketResolutionStarted,
             objective_id,
+            task_id,
+            ticket_id,
             ObjectiveProgressPhase::Running,
             ObjectiveStatus::Running,
             format!(
@@ -1185,7 +1384,12 @@ impl RunOrchestrator {
             }
         };
 
-        let guidance = render_resolver_guidance(&parsed);
+        let guidance = add_deterministic_unblock_guidance(
+            render_resolver_guidance(&parsed),
+            &objective,
+            &task,
+            &ticket,
+        );
         let resolution_path = self.write_artifact(
             &task.id,
             Some(&run_id),
@@ -1232,23 +1436,31 @@ impl RunOrchestrator {
             Some(&exchange_id),
             None,
         )?;
+        let resolved_message = format!(
+            "resolved ticket {}: {}",
+            ticket.id,
+            resolution_excerpt(&guidance)
+        );
         self.persist_objective_event(
             objective_id,
             ObjectiveProgressKind::TicketResolutionCompleted,
-            format!("resolved ticket {}", ticket.id),
+            resolved_message.clone(),
             json!({
                 "ticket_id": ticket.id.as_str(),
                 "task_id": task.id.as_str(),
                 "resolution_id": resolution.id.as_str(),
                 "planner_exchange_id": exchange_id.as_str(),
+                "resolution_excerpt": resolution_excerpt(&guidance),
             }),
         )?;
-        Ok(vec![event(
+        Ok(vec![task_ticket_event(
             ObjectiveProgressKind::TicketResolutionCompleted,
             objective_id,
+            &task.id,
+            &ticket.id,
             ObjectiveProgressPhase::Running,
             ObjectiveStatus::Running,
-            format!("resolved ticket {}", ticket.id),
+            resolved_message,
         )])
     }
 
@@ -1486,6 +1698,172 @@ fn event(
     CommandEvent::objective_progress(progress, CommandEventLevel::Info)
 }
 
+fn task_event(
+    kind: ObjectiveProgressKind,
+    objective_id: &ObjectiveId,
+    task_id: &TaskId,
+    phase: ObjectiveProgressPhase,
+    status: ObjectiveStatus,
+    message: impl Into<String>,
+) -> CommandEvent {
+    let mut event = event(kind, objective_id, phase, status, message);
+    if let Some(progress) = &mut event.objective_progress {
+        progress.task_id = Some(task_id.clone());
+    }
+    event
+}
+
+fn task_ticket_event(
+    kind: ObjectiveProgressKind,
+    objective_id: &ObjectiveId,
+    task_id: &TaskId,
+    ticket_id: &TicketId,
+    phase: ObjectiveProgressPhase,
+    status: ObjectiveStatus,
+    message: impl Into<String>,
+) -> CommandEvent {
+    let mut event = task_event(kind, objective_id, task_id, phase, status, message);
+    if let Some(progress) = &mut event.objective_progress {
+        progress.ticket_id = Some(ticket_id.clone());
+    }
+    event
+}
+
+fn ticket_detected_message(task_id: &TaskId, ticket: &crate::domain::Ticket) -> String {
+    format!(
+        "detected ticket {} for generated task {}: {}",
+        ticket.id,
+        task_id,
+        ticket_summary(ticket)
+    )
+}
+
+fn ticket_summary(ticket: &crate::domain::Ticket) -> String {
+    let reason = compact_one_line(&ticket.reason, 120);
+    let question = compact_one_line(&ticket.question, 100);
+    if question.is_empty() {
+        format!("{}: {}", ticket.blocked_on, reason)
+    } else {
+        format!("{}: {}; question: {}", ticket.blocked_on, reason, question)
+    }
+}
+
+fn resolution_excerpt(text: &str) -> String {
+    let mut capture_next = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("## Diagnosis") {
+            capture_next = true;
+            continue;
+        }
+        if capture_next && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            return compact_one_line(trimmed, 180);
+        }
+    }
+    compact_one_line(
+        text.lines()
+            .find(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .unwrap_or("resolver produced guidance"),
+        180,
+    )
+}
+
+fn compact_one_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut output = compact
+        .chars()
+        .take(max_chars.saturating_sub(12))
+        .collect::<String>();
+    output.push_str(" [truncated]");
+    output
+}
+
+fn stream_new_events(
+    sink: &mut Option<&mut dyn OutputSink>,
+    events: &[CommandEvent],
+    skip: usize,
+) -> HarnessResult<()> {
+    let Some(sink) = sink.as_deref_mut() else {
+        return Ok(());
+    };
+    for event in events.iter().skip(skip) {
+        sink.event(event)?;
+    }
+    Ok(())
+}
+
+fn starts_with_worker_started(events: &[CommandEvent]) -> bool {
+    events
+        .first()
+        .and_then(|event| event.objective_progress.as_ref())
+        .is_some_and(|progress| progress.kind == ObjectiveProgressKind::WorkerStarted)
+}
+
+fn worker_completed_message(
+    task: &Task,
+    result: &CommandResult,
+    store: &dyn TaskStore,
+) -> HarnessResult<String> {
+    let output = latest_local_worker_output(result);
+    let Some(run_id) = result
+        .data
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            result
+                .data
+                .get("run_ids")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|run_ids| run_ids.iter().rev().find_map(serde_json::Value::as_str))
+        })
+        .and_then(|run_id| RunId::parse(run_id).ok())
+    else {
+        return Ok(match output {
+            Some(output) => format!("generated task {} completed:\n{}", task.id, output),
+            None => format!("generated task {} completed", task.id),
+        });
+    };
+    let attempts = store.list_attempts(&run_id)?;
+    let Some(attempt) = attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.provider == "ollama")
+    else {
+        return Ok(format!("generated task {} completed", task.id));
+    };
+    if let Some(output) = output {
+        return Ok(format!(
+            "generated task {} completed via local Ollama model {} attempt {} ({}):\n{}",
+            task.id, attempt.model, attempt.attempt_number, attempt.status, output
+        ));
+    }
+    Ok(format!(
+        "generated task {} completed via local Ollama model {} attempt {} ({})",
+        task.id, attempt.model, attempt.attempt_number, attempt.status
+    ))
+}
+
+fn latest_local_worker_output(result: &CommandResult) -> Option<String> {
+    result
+        .data
+        .get("progress_events")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .filter_map(|event| event.get("message").and_then(serde_json::Value::as_str))
+        .find_map(|message| {
+            message
+                .find("local Ollama ")
+                .map(|index| message[index..].to_string())
+        })
+}
+
 fn render_resolver_guidance(response: &TicketResolverResponse) -> String {
     let mut text = String::new();
     text.push_str("# Objective Ticket Resolution\n\n");
@@ -1514,6 +1892,66 @@ fn render_resolver_guidance(response: &TicketResolverResponse) -> String {
         }
     }
     text
+}
+
+fn add_deterministic_unblock_guidance(
+    mut guidance: String,
+    objective: &crate::state::Objective,
+    task: &Task,
+    ticket: &crate::domain::Ticket,
+) -> String {
+    guidance.push_str("\n## Supervisor Execution Guidance\n\n");
+    guidance.push_str("- Treat the objective prompt, task goal, acceptance criteria, and validation commands as enough authority to choose reasonable conventional defaults.\n");
+    guidance.push_str("- Do not ask the same broad product-scope question again after this resolution. If details are underspecified, implement the smallest conventional version that satisfies the task and validation.\n");
+    guidance.push_str("- If expected files or scaffolding are absent, create the minimal conventional structure needed for the requested implementation.\n");
+    guidance.push_str("- Return a concrete unified git diff unless a specific missing fact cannot be reasonably defaulted and directly blocks validation.\n");
+
+    if rust_scaffold_blocker(objective, task, ticket) {
+        guidance.push_str("\n## Supervisor Deterministic Guidance\n\n");
+        guidance.push_str(
+            "- This repository may legitimately be empty. Missing Cargo.toml or src/main.rs is not a blocker.\n",
+        );
+        guidance.push_str(
+            "- Do not return STUCK because Rust source files or crate structure are missing. Create the scaffold in the next diff.\n",
+        );
+        guidance.push_str(
+            "- Create Cargo.toml with a standard [package] section, edition = \"2021\", and no [bin] table unless explicitly needed.\n",
+        );
+        guidance.push_str(
+            "- Create src/main.rs and implement the requested Rust application there. For a simple terminal game, prefer std-only code unless the existing project already has dependencies.\n",
+        );
+        guidance.push_str(
+            "- Return a unified git diff that creates Cargo.toml and src/main.rs using --- /dev/null and +++ b/<path> hunks.\n",
+        );
+    }
+    guidance
+}
+
+fn rust_scaffold_blocker(
+    objective: &crate::state::Objective,
+    task: &Task,
+    ticket: &crate::domain::Ticket,
+) -> bool {
+    let intent = format!("{} {} {}", objective.prompt, task.title, task.goal).to_ascii_lowercase();
+    if !intent.contains("rust") && !intent.contains("cargo") {
+        return false;
+    }
+    let blocker = format!(
+        "{} {} {}",
+        ticket.blocked_on, ticket.reason, ticket.question
+    )
+    .to_ascii_lowercase();
+    let mentions_missing_source = blocker.contains("missing")
+        || blocker.contains("no rust source")
+        || blocker.contains("no source")
+        || blocker.contains("not found");
+    let mentions_scaffold = blocker.contains("cargo.toml")
+        || blocker.contains("src/main.rs")
+        || blocker.contains("crate")
+        || blocker.contains("source files")
+        || blocker.contains("repository context")
+        || blocker.contains("project structure");
+    mentions_missing_source && mentions_scaffold
 }
 
 struct NeverCancelled;

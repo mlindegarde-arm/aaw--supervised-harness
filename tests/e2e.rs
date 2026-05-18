@@ -270,7 +270,7 @@ fn binary_objective_start_supervise_success_emits_strict_json_and_objective_even
 }
 
 #[test]
-fn binary_objective_start_supervise_blocked_emits_strict_json_and_objective_events() {
+fn binary_objective_start_supervise_direct_worker_success_emits_strict_json_and_objective_events() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture = create_or_reuse_fixture(temp.path(), FixtureKind::RustSuccess);
     let local_model = "binary-local-model";
@@ -305,30 +305,27 @@ fn binary_objective_start_supervise_blocked_emits_strict_json_and_objective_even
         "16",
     ]);
 
-    let json = assert_binary_json_contract(&output, "failed", 1);
-    assert_eq!(json["data"]["status"], "blocked", "{json:#?}");
+    let json = assert_binary_json_contract(&output, "complete", 0);
+    assert_eq!(json["data"]["status"], "complete", "{json:#?}");
     assert_eq!(json["data"]["terminal"], true, "{json:#?}");
-    assert_eq!(json["data"]["validation"]["status"], "skipped", "{json:#?}");
+    assert_eq!(json["data"]["validation"]["status"], "passed", "{json:#?}");
+    assert_eq!(json["data"]["validation"]["commands_run"], 1, "{json:#?}");
 
     let events = assert_objective_ndjson_events(&output.stderr);
-    assert!(
-        events
-            .iter()
-            .any(|event| event["event"] == "objective.planning_started"),
-        "{events:#?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event["event"] == "objective.planning_completed"),
-        "{events:#?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event["event"] == "objective.blocked"),
-        "{events:#?}"
-    );
+    for expected in [
+        "objective.planning_started",
+        "objective.planning_completed",
+        "objective.supervision_started",
+        "objective.worker_started",
+        "objective.worker_completed",
+        "objective.validation_passed",
+        "objective.completed",
+    ] {
+        assert!(
+            events.iter().any(|event| event["event"] == expected),
+            "missing {expected} in {events:#?}"
+        );
+    }
 }
 
 #[test]
@@ -1999,6 +1996,14 @@ impl WorkspaceManager for FixedRepoWorkspace {
 
     fn apply_patch(&self, patch: PatchCheck) -> HarnessResult<PatchApplyResult> {
         self.inner.apply_patch(patch)
+    }
+
+    fn commit_all(&self, worktree_path: &str, message: &str) -> HarnessResult<String> {
+        self.inner.commit_all(worktree_path, message)
+    }
+
+    fn fast_forward_repo(&self, repo_root: &str, branch: &str) -> HarnessResult<String> {
+        self.inner.fast_forward_repo(repo_root, branch)
     }
 
     fn cleanup_task_worktree(&self, task_id: &TaskId, force: bool) -> HarnessResult<()> {

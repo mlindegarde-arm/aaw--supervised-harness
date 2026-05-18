@@ -80,10 +80,10 @@ impl Default for HarnessConfig {
                 kill_process_group_on_timeout: true,
             },
             orchestrator: OrchestratorConfig {
-                max_attempts: 3,
+                max_attempts: 6,
                 max_invalid_responses: 2,
                 max_provider_failures: 2,
-                max_escalation_cycles: 1,
+                max_escalation_cycles: 8,
                 validation_timeout_seconds: 120,
                 max_validation_output_bytes: 65_536,
                 max_patch_bytes: 131_072,
