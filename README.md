@@ -1,5 +1,10 @@
 # Harness Supervisor
 
+> **AI-authored project note:** This codebase was written entirely by AI using `codex --dangerously-bypass-approvals-and-sandbox`, the experimental Codex
+> `Goals` feature, and Codex subagents. The initial plans, designs, and task breakdowns were developed interactively with Codex so the work could be split
+> across parallel efforts and kept moving in the intended direction. After that, Codex ran for several hours, with human check-ins between major task
+> completions.
+
 ```mermaid
 flowchart LR
     User["User prompt or CLI command"] --> Harness["harness CLI / TUI"]
