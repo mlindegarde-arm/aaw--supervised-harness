@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .title { font: 700 44px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 400 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .label { font: 700 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .body { font: 400 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .small { font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 14; }
+      .blue { fill: #eaf2ff; stroke: #2563eb; }
+      .green { fill: #e8f6ef; stroke: #1f8a5b; }
+      .amber { fill: #fff6df; stroke: #b7791f; }
+      .purple { fill: #f1edff; stroke: #6d28d9; }
+      .gray { fill: #f3f4f6; stroke: #6b7280; }
+      .arrow { stroke: #475569; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .lane { fill: #f0f2f4; stroke: #d9dde4; stroke-width: 1; rx: 18; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1600" height="900"/>
+  <text x="70" y="76" class="title">Review Pending PRs Skill: Human-Gated Multi-Agent Review</text>
+  <text x="70" y="116" class="subtitle">A Codex skill that turns PR review into a repeatable, inspectable workflow with explicit final human control.</text>
+
+  <rect x="65" y="160" width="1470" height="150" class="lane"/>
+  <text x="95" y="197" class="label">Discovery</text>
+  <rect x="115" y="220" width="280" height="60" class="box blue"/>
+  <text x="140" y="257" class="label">Repository scope</text>
+  <rect x="505" y="220" width="280" height="60" class="box blue"/>
+  <text x="530" y="257" class="label">GitHub PR query</text>
+  <rect x="895" y="220" width="285" height="60" class="box gray"/>
+  <text x="920" y="257" class="label">Filter candidates</text>
+  <rect x="1285" y="220" width="185" height="60" class="box gray"/>
+  <text x="1310" y="257" class="label">Batch plan</text>
+  <path class="arrow" d="M395 250 H505"/>
+  <path class="arrow" d="M785 250 H895"/>
+  <path class="arrow" d="M1180 250 H1285"/>
+
+  <rect x="65" y="350" width="1470" height="250" class="lane"/>
+  <text x="95" y="387" class="label">Independent review passes</text>
+  <rect x="115" y="430" width="300" height="110" class="box green"/>
+  <text x="140" y="463" class="label">Prepare PR context</text>
+  <text x="140" y="490" class="body">Clone, diff, PR JSON</text>
+  <text x="140" y="516" class="body">Existing comments</text>
+  <rect x="535" y="390" width="290" height="70" class="box purple"/>
+  <text x="560" y="423" class="label">Agent A</text>
+  <text x="560" y="448" class="small">Correctness and contracts</text>
+  <rect x="535" y="475" width="290" height="70" class="box amber"/>
+  <text x="560" y="508" class="label">Agent B</text>
+  <text x="560" y="533" class="small">Operations and safety</text>
+  <rect x="535" y="560" width="290" height="70" class="box blue"/>
+  <text x="560" y="593" class="label">Agent C</text>
+  <text x="560" y="618" class="small">Tests and integration</text>
+  <rect x="965" y="450" width="305" height="100" class="box green"/>
+  <text x="990" y="483" class="label">Consolidate findings</text>
+  <text x="990" y="510" class="body">Merge duplicates</text>
+  <text x="990" y="536" class="body">Drop non-material nits</text>
+  <path class="arrow" d="M415 485 H535"/>
+  <path class="arrow" d="M825 425 C875 425 900 470 965 470"/>
+  <path class="arrow" d="M825 510 H965"/>
+  <path class="arrow" d="M825 595 C880 595 900 530 965 530"/>
+
+  <rect x="65" y="640" width="1470" height="170" class="lane"/>
+  <text x="95" y="677" class="label">Human decision and GitHub action</text>
+  <rect x="115" y="710" width="310" height="65" class="box amber"/>
+  <text x="140" y="749" class="label">Review queue</text>
+  <rect x="535" y="710" width="305" height="65" class="box gray"/>
+  <text x="560" y="749" class="label">Approve / comment / skip</text>
+  <rect x="950" y="710" width="305" height="65" class="box blue"/>
+  <text x="975" y="749" class="label">Create GitHub review</text>
+  <rect x="1365" y="710" width="105" height="65" class="box green"/>
+  <text x="1390" y="749" class="label">Clean up</text>
+  <path class="arrow" d="M425 742 H535"/>
+  <path class="arrow" d="M840 742 H950"/>
+  <path class="arrow" d="M1255 742 H1365"/>
+  <text x="70" y="855" class="small">Key constraint: agents never approve, comment, request changes, push, or modify files. GitHub-side effects happen only after user confirmation.</text>
+</svg>

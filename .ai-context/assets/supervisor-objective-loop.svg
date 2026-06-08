@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font: 700 44px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 400 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .label { font: 700 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .body { font: 400 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .small { font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 14; }
+      .green { fill: #e8f6ef; stroke: #1f8a5b; }
+      .blue { fill: #eaf2ff; stroke: #2563eb; }
+      .amber { fill: #fff6df; stroke: #b7791f; }
+      .red { fill: #fff0f0; stroke: #dc2626; }
+      .gray { fill: #f3f4f6; stroke: #6b7280; }
+      .arrow { stroke: #475569; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 9 8; }
+      .lane { fill: #eef2f7; stroke: #d4dae5; stroke-width: 1; rx: 18; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1600" height="900"/>
+  <text x="70" y="76" class="title">Harness Supervisor: Objective Loop</text>
+  <text x="70" y="116" class="subtitle">Prompt-first orchestration with local worker execution, remote planning, ticket escalation, and validation gates.</text>
+
+  <rect x="60" y="160" width="1480" height="160" class="lane"/>
+  <text x="90" y="196" class="label">Intent and planning</text>
+  <rect x="100" y="220" width="245" height="70" class="box blue"/>
+  <text x="125" y="252" class="label">Objective prompt</text>
+  <text x="125" y="277" class="small">Natural-language goal</text>
+  <rect x="450" y="220" width="270" height="70" class="box blue"/>
+  <text x="475" y="252" class="label">Planner model</text>
+  <text x="475" y="277" class="small">Acceptance criteria and tasks</text>
+  <rect x="830" y="220" width="290" height="70" class="box green"/>
+  <text x="855" y="252" class="label">Reviewed plan</text>
+  <text x="855" y="277" class="small">Trusted validation commands</text>
+  <rect x="1230" y="220" width="250" height="70" class="box gray"/>
+  <text x="1255" y="252" class="label">Persist state</text>
+  <text x="1255" y="277" class="small">SQLite and artifacts</text>
+  <path class="arrow" d="M345 255 H450"/>
+  <path class="arrow" d="M720 255 H830"/>
+  <path class="arrow" d="M1120 255 H1230"/>
+
+  <rect x="60" y="360" width="1480" height="220" class="lane"/>
+  <text x="90" y="396" class="label">Execution and escalation</text>
+  <rect x="100" y="425" width="270" height="90" class="box amber"/>
+  <text x="125" y="458" class="label">Generated task</text>
+  <text x="125" y="485" class="body">Worker-ready goal</text>
+  <rect x="465" y="425" width="295" height="90" class="box green"/>
+  <text x="490" y="458" class="label">Isolated worktree</text>
+  <text x="490" y="485" class="body">Patch apply + validation</text>
+  <rect x="855" y="425" width="290" height="90" class="box green"/>
+  <text x="880" y="458" class="label">Local Ollama worker</text>
+  <text x="880" y="485" class="body">Patch or STUCK signal</text>
+  <rect x="1235" y="425" width="250" height="90" class="box red"/>
+  <text x="1260" y="458" class="label">Ticket resolver</text>
+  <text x="1260" y="485" class="body">Remote guidance only</text>
+  <path class="arrow" d="M370 470 H465"/>
+  <path class="arrow" d="M760 470 H855"/>
+  <path class="arrow" d="M1145 455 C1180 435 1200 430 1235 430"/>
+  <path class="arrow dash" d="M1235 510 C1080 580 685 585 610 515"/>
+  <text x="725" y="552" class="small">Resolved tickets are fed back into the next local prompt, not applied directly.</text>
+
+  <rect x="60" y="620" width="1480" height="190" class="lane"/>
+  <text x="90" y="656" class="label">Feedback and control</text>
+  <rect x="100" y="685" width="305" height="80" class="box blue"/>
+  <text x="125" y="718" class="label">Objective dashboard</text>
+  <text x="125" y="745" class="body">Lifecycle, workers, tickets</text>
+  <rect x="510" y="685" width="310" height="80" class="box gray"/>
+  <text x="535" y="718" class="label">Artifacts and logs</text>
+  <text x="535" y="745" class="body">Prompts, diffs, responses</text>
+  <rect x="925" y="685" width="285" height="80" class="box green"/>
+  <text x="950" y="718" class="label">Final validation</text>
+  <text x="950" y="745" class="body">Acceptance commands pass</text>
+  <rect x="1310" y="685" width="175" height="80" class="box green"/>
+  <text x="1335" y="718" class="label">Complete</text>
+  <text x="1335" y="745" class="body">or blocked</text>
+  <path class="arrow" d="M405 725 H510"/>
+  <path class="arrow" d="M820 725 H925"/>
+  <path class="arrow" d="M1210 725 H1310"/>
+  <path class="arrow dash" d="M955 685 C880 615 790 580 695 515"/>
+  <text x="70" y="855" class="small">Safety boundary: worker patches are isolated in task worktrees; validation commands are policy-reviewed; persisted text is redacted before output.</text>
+</svg>
