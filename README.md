@@ -1,16 +1,136 @@
 # Harness Supervisor
 
-`harness` is a CLI and terminal UI for running goal-driven coding work against a git repository. The intended Phase 3 workflow is prompt-first:
+```mermaid
+flowchart LR
+    User["User prompt or CLI command"] --> Harness["harness CLI / TUI"]
+    Harness --> State[".harness/state.sqlite<br/>objectives, tasks, runs, tickets"]
+    Harness --> Artifacts[".harness/artifacts + logs<br/>prompts, responses, patches, validation output"]
+    Harness --> Planner["OpenAI-compatible planner<br/>default: gpt-5.3-codex via Arm proxy"]
+    Planner --> Plan["Validated objective plan<br/>acceptance criteria, validation commands, generated tasks"]
+    Plan --> State
+    Harness --> Supervisor["Objective monitor"]
+    Supervisor --> Worker["Local Ollama worker<br/>default: maternion/strand-rust-coder:latest"]
+    Worker --> Worktree["isolated git worktree<br/>branch: harness/task_..."]
+    Worktree --> Validation["trusted validation commands<br/>cargo test, cargo build, cargo check, etc."]
+    Validation -->|passes| Complete["commit task branch<br/>fast-forward target repo"]
+    Validation -->|fails or blocked| Ticket["ticket with evidence"]
+    Ticket --> Resolver["OpenAI-compatible ticket resolver"]
+    Resolver --> Worker
+    Complete --> Supervisor
+    Supervisor -->|all tasks complete| Acceptance["objective acceptance validation"]
+    Acceptance -->|passes| Done["objective complete"]
+    Acceptance -->|fails| Repair["generated repair task"]
+    Repair --> Supervisor
+```
 
-1. You give the system an objective, such as "Create a Rust clone of the Volt CLI in this repository: https://github.com/Arm-Volt/volt-cli".
-2. The OpenAI-compatible planner model turns that objective into acceptance criteria, validation commands, and small generated tasks.
-3. Local Ollama workers implement generated tasks in isolated git worktrees.
-4. If a local worker gets stuck, the system creates a ticket.
-5. The OpenAI-compatible resolver answers the ticket.
-6. The local worker resumes with that resolution.
-7. The monitor repeats until acceptance validation passes, the objective blocks, fails, is cancelled, or a cycle/attempt limit is reached.
+`harness` is a Rust CLI and terminal UI for supervising AI-assisted coding work in a git repository. You give it a natural-language objective; it asks an OpenAI-compatible planner to turn that objective into a structured plan; then it runs local Ollama coding workers against generated tasks in isolated git worktrees. The main repository is updated only after a task validates and its task branch can be fast-forwarded back into the target checkout.
 
-Use a disposable or clean git repository first. The tool creates `.harness/` state, logs, artifacts, and task worktrees. Model-generated patches are applied inside task worktrees, not directly to your main checkout.
+The project has three main loops:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant H as harness
+    participant P as OpenAI-compatible planner
+    participant O as Ollama worker
+    participant R as OpenAI-compatible resolver
+    participant G as Git repo/worktrees
+
+    U->>H: objective start --prompt "Create Snake in Rust" --supervise
+    H->>P: planner request with prompt + repository context
+    P-->>H: strict JSON plan
+    H->>H: validate schema, paths, dependencies, and validation policy
+    H->>G: create task worktree from HEAD
+    H->>O: worker prompt with task goal, repo context, validation logs
+    O-->>H: unified diff, or STUCK reason/question
+    H->>G: check/apply diff, run trusted validation
+    alt task validation passes
+        H->>G: commit worktree and fast-forward target repo
+    else worker gets stuck
+        H->>R: ticket context and evidence
+        R-->>H: advisory resolution JSON
+        H->>O: resume worker with ticket guidance
+    end
+    H->>G: run objective acceptance validation
+```
+
+## How The Pieces Fit Together
+
+- **CLI/TUI**: `harness` can run as a normal CLI or as a prompt-first TUI when started with no command in a terminal.
+- **Objective planner**: `objective start` sends the prompt plus a compact repository context to the OpenAI-compatible provider. The response must be strict JSON containing an objective summary, acceptance criteria, validation commands, generated tasks, task dependencies, risks, and final verification notes.
+- **Plan validation**: planner output is checked before use. The code rejects invalid schemas, invalid task graphs, repo path escapes, too many tasks, and generated tasks without at least one trusted validation command.
+- **Task worker**: generated tasks are executed by the local Ollama provider. The worker must return either a fenced unified diff or a `STUCK` response with a reason and question.
+- **Worktrees**: each task runs in an isolated git worktree and task branch. Successful task attempts are committed in that worktree; completed generated tasks are then fast-forwarded into the target repository.
+- **Tickets**: when a worker cannot make progress, `harness` stores a ticket with evidence such as validation output, prior attempts, current diff, and worker responses.
+- **Ticket resolver**: the OpenAI-compatible resolver answers tickets with advisory guidance only. It does not directly patch the repo.
+- **Acceptance validation**: after generated tasks are complete, `harness` runs trusted objective-level validation commands. If they fail, the objective monitor can create a repair task and continue.
+
+Use a disposable or clean git repository first. The tool writes `.harness/config.toml`, `.harness/state.sqlite`, `.harness/logs/`, `.harness/artifacts/`, and task worktrees under the configured worktree root. Model-generated patches are applied inside task worktrees first, not directly to your main checkout.
+
+## Example CLI Commands
+
+Initialize a target repository and verify local setup:
+
+```sh
+REPO=/path/to/disposable/snake-rust
+harness --repo "$REPO" init --output json
+harness --repo "$REPO" doctor --offline --output json
+harness --repo "$REPO" doctor --providers local --output json
+harness --repo "$REPO" doctor --providers all --output json
+```
+
+Start the prompt-first workflow from the TUI:
+
+```sh
+harness --repo "$REPO"
+```
+
+Then enter a prompt such as:
+
+```text
+Create the game Snake using Rust. Build it as a terminal-playable Rust project with conventional Cargo structure, keyboard controls, scoring, collision detection, and tests where practical.
+```
+
+Run the same workflow without opening the TUI:
+
+```sh
+harness --repo "$REPO" objective start \
+  --prompt "Create the game Snake using Rust. Build it as a terminal-playable Rust project with conventional Cargo structure, keyboard controls, scoring, collision detection, and tests where practical." \
+  --supervise \
+  --planner-model gpt-5.3-codex \
+  --worker-model maternion/strand-rust-coder:latest \
+  --ticket-model gpt-5.3-codex \
+  --max-worker-attempts 32 \
+  --max-cycles 16 \
+  --output json
+```
+
+Inspect or resume the work:
+
+```sh
+harness --repo "$REPO" objective list
+harness --repo "$REPO" objective get <objective-id>
+harness --repo "$REPO" objective plan <objective-id>
+harness --repo "$REPO" objective supervise <objective-id> --max-worker-attempts 32 --max-cycles 16
+harness --repo "$REPO" objective validate <objective-id> --dry-run
+harness --repo "$REPO" objective validate <objective-id>
+```
+
+## Snake Objective Walkthrough
+
+Given a prompt to create Snake in Rust, the system should behave like this in theory:
+
+1. `harness objective start` creates an objective in `.harness/state.sqlite` with status `planning`.
+2. The planner call goes to the configured OpenAI-compatible endpoint, by default the Arm OpenAI API proxy using `gpt-5.3-codex`.
+3. The planner returns a JSON plan. For a simple Snake prompt, a good plan is usually one generated implementation task that creates or updates `Cargo.toml` and `src/main.rs`, plus validation such as `cargo build`, `cargo test`, or `cargo check`. The planner may choose a different valid breakdown if the repository already contains relevant code.
+4. `harness` validates the plan. It accepts only safe, unattended validation commands from the allowlist and rejects shell chaining, redirection, destructive commands, path escapes, and tasks that cannot be validated.
+5. The objective monitor selects the next ready generated task and invokes the local Ollama worker model, by default `maternion/strand-rust-coder:latest`.
+6. The worker sees the task goal, repository context, any current diff, prior attempt summaries, and validation logs. It returns a unified diff that implements the Rust Snake project, or it returns `STUCK` with a concrete question.
+7. `harness` checks patch safety, applies the diff in the task worktree, runs the task validation commands, and records prompt/response/patch/validation artifacts.
+8. If validation passes, `harness` commits the worktree changes and fast-forwards the target repo from the task branch.
+9. If validation fails repeatedly or the worker returns `STUCK`, `harness` opens a ticket. The OpenAI-compatible resolver returns bounded guidance, and the local Ollama worker resumes with that guidance.
+10. After all generated tasks complete, `harness` runs objective acceptance validation. Passing validation marks the objective `complete`; failing validation can create a repair task; exhausting cycles or worker attempts marks the objective blocked or failed.
 
 ## Build And Install
 
